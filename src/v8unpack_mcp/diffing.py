@@ -11,6 +11,7 @@ import difflib
 import os
 
 from . import core
+from . import mxl
 
 # Максимум строк диффа на файл и максимум файлов на объект.
 MAX_DIFF_LINES = 400
@@ -18,7 +19,11 @@ MAX_DIFF_FILES = 20
 
 
 def _collect_files(d):
-    """Собрать файлы каталога в {относительный_путь: bytes} (без .id.json и скрытых)."""
+    """Собрать файлы каталога в {относительный_путь: bytes} (без .id.json и скрытых).
+
+    Табличные документы (.mxl) декодируются в канонический текст (структурный diff),
+    остальные файлы сравниваются по байтам.
+    """
     result = {}
     if not os.path.isdir(d):
         return result
@@ -31,9 +36,15 @@ def _collect_files(d):
             rel = os.path.relpath(full, d)
             try:
                 with open(full, "rb") as f:
-                    result[rel] = f.read()
+                    data = f.read()
             except OSError:
-                pass
+                continue
+            if fn.lower().endswith(".mxl"):
+                try:
+                    data = mxl.to_text(mxl.decode(data)).encode("utf-8")
+                except Exception:
+                    pass
+            result[rel] = data
     return result
 
 
@@ -42,6 +53,11 @@ def _unified_diff(a_lines, b_lines, label):
         a_lines, b_lines, fromfile=f"{label} (было)", tofile=f"{label} (стало)", lineterm=""
     )
     return "\n".join(diff)
+
+
+def _is_binary(data: bytes) -> bool:
+    """Эвристика: бинарный файл содержит NUL-байт (текст UTF-8 — нет)."""
+    return b"\x00" in data
 
 
 def _diff_from_collected(fa, fb, name):
@@ -65,14 +81,17 @@ def _diff_from_collected(fa, fb, name):
             entry["status"] = "changed"
             entry["old_bytes"] = len(a)
             entry["new_bytes"] = len(b)
-            entry["diff"] = _unified_diff(
-                a.decode("utf-8", "replace").splitlines(),
-                b.decode("utf-8", "replace").splitlines(),
-                rel,
-            )
-            if len(entry["diff"].splitlines()) > MAX_DIFF_LINES:
-                entry["diff"] = "\n".join(entry["diff"].splitlines()[:MAX_DIFF_LINES])
-                entry["diff_truncated"] = True
+            if _is_binary(a) or _is_binary(b):
+                entry["binary"] = True
+            else:
+                entry["diff"] = _unified_diff(
+                    a.decode("utf-8", "replace").splitlines(),
+                    b.decode("utf-8", "replace").splitlines(),
+                    rel,
+                )
+                if len(entry["diff"].splitlines()) > MAX_DIFF_LINES:
+                    entry["diff"] = "\n".join(entry["diff"].splitlines()[:MAX_DIFF_LINES])
+                    entry["diff_truncated"] = True
         changes.append(entry)
     return changes, truncated
 

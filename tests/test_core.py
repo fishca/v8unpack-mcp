@@ -11,6 +11,7 @@ import tempfile
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from v8unpack_mcp import core
+from v8unpack_mcp import diffing
 
 TESTDATA = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "testdata"))
 EPF = os.path.join(TESTDATA, "ФормированиеЗаказовРегламентное_300762_(27).epf")
@@ -139,6 +140,112 @@ def test_set_help_edit_and_repack():
         shutil.rmtree(d, ignore_errors=True)
         if os.path.isfile(out):
             os.remove(out)
+
+
+def _cfe_table_mxls(d):
+    """Табличные макеты DataProcessor/ТН_ЗагрузкаТоваровИзВнешнихФайлов: {имя: путь .mxl}."""
+    obj = os.path.join(d, "DataProcessor", "ТН_ЗагрузкаТоваровИзВнешнихФайлов")
+    tdir = os.path.join(obj, "Template")
+    result = {}
+    for name in sorted(os.listdir(tdir)):
+        mxl = os.path.join(tdir, name, "Template.mxl")
+        if os.path.isfile(mxl):
+            result[name] = mxl
+    return result
+
+
+def test_import_template_replace_roundtrip():
+    d = _unpack(CFE)
+    out = os.path.join(tempfile.gettempdir(), "v8unpack_mcp_import_replace.cfe")
+    src = os.path.join(tempfile.gettempdir(), "v8unpack_mcp_src.mxl")
+    try:
+        mxls = _cfe_table_mxls(d)
+        assert "Макет" in mxls
+        with open(mxls["Макет"], "rb") as f:
+            orig = f.read()
+        modified = orig + b"\x00\x01\x02"
+        with open(src, "wb") as f:
+            f.write(modified)
+        res = core.import_template(d, "DataProcessor/ТН_ЗагрузкаТоваровИзВнешнихФайлов",
+                                   src, "Макет")
+        assert res["ok"] is True
+        assert res["template_name"] == "Макет"
+        assert res["uuid"]
+        # организованный Template.mxl намеренно не менялся (raw-слой)
+        with open(mxls["Макет"], "rb") as f:
+            assert f.read() == orig
+        r2 = core.repack(d, out)
+        assert r2["status"] == "ok"
+        d2 = _unpack(out)
+        try:
+            with open(_cfe_table_mxls(d2)["Макет"], "rb") as f:
+                assert f.read() == modified
+        finally:
+            core.cleanup(d2)
+    finally:
+        core.cleanup(d)
+        if os.path.isfile(src):
+            os.remove(src)
+        if os.path.isfile(out):
+            os.remove(out)
+
+
+def test_import_template_rejects_non_moxcel():
+    d = _unpack(CFE)
+    src = os.path.join(tempfile.gettempdir(), "v8unpack_mcp_not_moxcel.mxl")
+    try:
+        with open(src, "wb") as f:
+            f.write(b"not a moxcel file")
+        try:
+            core.import_template(d, "DataProcessor/ТН_ЗагрузкаТоваровИзВнешнихФайлов",
+                                 src, "Макет")
+        except ValueError:
+            return
+        raise AssertionError("ожидался ValueError на не-MOXCEL файле")
+    finally:
+        core.cleanup(d)
+        if os.path.isfile(src):
+            os.remove(src)
+
+
+def test_read_template():
+    d = _unpack(CFE)
+    try:
+        r = core.read_template(d, "DataProcessor/ТН_ЗагрузкаТоваровИзВнешнихФайлов", "Макет")
+        assert r["template_name"] == "Макет"
+        assert r["bytes"] > 0
+        assert r["top_level_elements"] > 0
+        assert "Штрихкод" in r["strings"] or "Артикул" in r["strings"]
+        assert r["structure"].startswith("[")
+    finally:
+        core.cleanup(d)
+
+
+def test_diff_mxl_structural():
+    a = _unpack(CFE)
+    b = _unpack(CFE)
+    try:
+        mxl_b = _cfe_table_mxls(b)["Макет"]
+        with open(mxl_b, "rb") as f:
+            data = f.read()
+        assert b'"N",1000' in data
+        with open(mxl_b, "wb") as f:
+            f.write(data.replace(b'"N",1000', b'"N",2000'))
+        rep = diffing.diff(a, b)
+        found = None
+        for obj in rep["objects"]:
+            if obj.get("diff"):
+                for fc in obj["diff"]["files"]:
+                    if fc["file"].endswith("Template.mxl"):
+                        found = fc
+        assert found is not None, "ожидалось структурное изменение Template.mxl"
+        assert found["status"] == "changed"
+        lines = found["diff"].splitlines()
+        assert any(l.startswith("-") and "1000" in l for l in lines)
+        assert any(l.startswith("+") and "2000" in l for l in lines)
+    finally:
+        core.cleanup(a)
+        core.cleanup(b)
 
 
 def test_unpack_missing_file():

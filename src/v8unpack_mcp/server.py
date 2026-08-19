@@ -75,8 +75,25 @@ def set_help(dir_path: str, object_path: str = "", help_html: str = "",
     return _dump(core.set_help(dir_path, object_path, help_html, overwrite))
 
 
+@mcp.tool(description="Импортировать готовый .mxl (табличный документ) в макет объекта — "
+                      "замена содержимого существующего макета (template_name или единственный). "
+                      "Пишет в raw-слой; сборку делает repack")
+def import_template(dir_path: str, object_path: str = "", template_path: str = "",
+                    template_name: str = "") -> str:
+    return _dump(core.import_template(dir_path, object_path, template_path, template_name or None))
+
+
+@mcp.tool(description="Прочитать табличный документ (MXL) макета в структурированном виде. "
+                      "Декодирует MOXCEL в дерево: возвращает канонический текст structure и "
+                      "список текстовых значений strings. Только чтение")
+def read_template(dir_path: str, object_path: str = "", template_name: str = "") -> str:
+    return _dump(core.read_template(dir_path, object_path, template_name or None))
+
+
 @mcp.tool(description="Сравнить два распакованных каталога (результат unpack) пообъектно. "
-                      "full=false — только факт изменения без построения диффа")
+                      "По содержимому (построчный diff): .mxl (декодируется структурно), .json, "
+                      ".obj.bsl, XML форм. По байтам (только факт изменения, помечается binary=true): "
+                      "зашифрованные .obj.bin, СКД .bin, картинки. full=false — только факт изменения без диффа")
 def diff(dir_a: str, dir_b: str, full: bool = True) -> str:
     return _dump(diffing.diff(dir_a, dir_b, full))
 

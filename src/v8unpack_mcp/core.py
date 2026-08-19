@@ -591,6 +591,176 @@ def set_help(dir_path: str, object_path: str = "", help_html: str = "",
     }
 
 
+# --- Макеты (табличные документы MXL) ---
+
+def _find_template_dir(obj_dir: str) -> str:
+    """Каталог макетов объекта (Template или Templates)."""
+    for name in ("Template", "Templates"):
+        p = os.path.join(obj_dir, name)
+        if os.path.isdir(p):
+            return p
+    for entry in sorted(os.listdir(obj_dir)):
+        p = os.path.join(obj_dir, entry)
+        if os.path.isdir(p) and "Template" in entry:
+            return p
+    raise ValueError(f"Каталог макетов (Template) не найден в {obj_dir}")
+
+
+def _template_items(template_dir: str) -> list:
+    """Табличные макеты (type='table') в каталоге макетов: [{name, dir, mxl, uuid, type}].
+
+    Табличный макет определяется наличием Template.mxl (СКД и прочие хранятся как
+    Template.bin / Template.json и сюда не попадают).
+    """
+    items = []
+    for entry in sorted(os.listdir(template_dir)):
+        p = os.path.join(template_dir, entry)
+        if not os.path.isdir(p):
+            continue
+        mxl = os.path.join(p, "Template.mxl")
+        if not os.path.isfile(mxl):
+            continue
+        ttype = None
+        tjson = os.path.join(p, "Template.json")
+        if os.path.isfile(tjson):
+            try:
+                ttype = json.load(open(tjson, encoding="utf-8")).get("type")
+            except (OSError, ValueError):
+                pass
+        if ttype and ttype != "table":
+            continue
+        uuid = None
+        idjson = os.path.join(p, "Template.id.json")
+        if os.path.isfile(idjson):
+            try:
+                uuid = json.load(open(idjson, encoding="utf-8")).get("uuid")
+            except (OSError, ValueError):
+                pass
+        items.append({"name": entry, "dir": p, "mxl": mxl, "uuid": uuid, "type": ttype or "table"})
+    return items
+
+
+def import_template(dir_path: str, object_path: str = "", template_path: str = "",
+                    template_name: str = None) -> dict:
+    """Импортировать готовый .mxl (табличный документ) — замена содержимого существующего макета.
+
+    Пишет в raw-слой (.v8unpack_raw/0/<uuid>.0), НЕ трогая организованное дерево,
+    поэтому repack идёт без полной пересборки и без потерь.
+
+    template_name — имя макета; пусто — если табличный макет ровно один.
+    object_path: '' — корневой объект .epf/.erf; 'Тип/Имя' — объект конфигурации/расширения.
+    Сборку НЕ выполняет — это делает repack.
+    """
+    root = _require_dir(dir_path)
+    if not template_path:
+        raise ValueError("template_path обязателен (путь к файлу .mxl)")
+    template_path = os.path.abspath(template_path)
+    if not os.path.isfile(template_path):
+        raise FileNotFoundError(template_path)
+
+    with open(template_path, "rb") as f:
+        src_bytes = f.read()
+    if not src_bytes.startswith(b"MOXCEL"):
+        raise ValueError(f"Файл не является табличным документом 1С (нет магии 'MOXCEL'): {template_path}")
+
+    obj_dir = os.path.join(root, object_path) if object_path else root
+    if not os.path.isdir(obj_dir):
+        raise FileNotFoundError(f"Объект {object_path or '<корень>'} не найден")
+    tdir = _find_template_dir(obj_dir)
+    items = _template_items(tdir)
+
+    target = None
+    if template_name:
+        for it in items:
+            if it["name"] == template_name:
+                target = it
+                break
+        if target is None:
+            raise ValueError(f"Макет '{template_name}' не найден; табличные макеты: {[i['name'] for i in items]}")
+    else:
+        if len(items) == 1:
+            target = items[0]
+        elif not items:
+            raise ValueError("В объекте нет табличных макетов для замены")
+        else:
+            raise ValueError(f"Табличных макетов несколько — укажите template_name: {[i['name'] for i in items]}")
+
+    if not target["uuid"]:
+        raise ValueError(f"У макета '{target['name']}' не определён uuid (нет Template.id.json)")
+    d0 = os.path.join(root, RAW_DIR, "0")
+    if not os.path.isdir(d0):
+        raise FileNotFoundError(f"В каталоге нет raw-слоя {RAW_DIR}/0 — unpack должен выполняться с keep_raw")
+    raw_file = os.path.join(d0, f"{target['uuid']}.0")
+    if not os.path.isfile(raw_file):
+        raise FileNotFoundError(f"raw-файл содержимого макета не найден: {raw_file}")
+    with open(raw_file, "wb") as f:
+        f.write(src_bytes)
+    return {
+        "ok": True,
+        "object_path": object_path or "<корень>",
+        "template_name": target["name"],
+        "uuid": target["uuid"],
+        "raw_file": raw_file,
+        "bytes": len(src_bytes),
+        "note": "Записано в raw-слой (.v8unpack_raw/0/<uuid>.0); repack возьмёт его без полной пересборки. Организованный Template.mxl намеренно не менялся.",
+    }
+
+
+def _pick_template(items: list, template_name: str, what: str) -> dict:
+    """Выбрать один табличный макет по имени (или единственный)."""
+    if template_name:
+        for it in items:
+            if it["name"] == template_name:
+                return it
+        raise ValueError(f"Макет '{template_name}' не найден; табличные макеты: {[i['name'] for i in items]}")
+    if len(items) == 1:
+        return items[0]
+    if not items:
+        raise ValueError(f"Нет табличных макетов для {what}")
+    raise ValueError(f"Табличных макетов несколько — укажите template_name: {[i['name'] for i in items]}")
+
+
+def _read_template_bytes(root: str, target: dict) -> bytes:
+    """Содержимое макета: из raw-слоя (актуально после import_template), иначе organized."""
+    if target.get("uuid"):
+        raw = os.path.join(root, RAW_DIR, "0", f"{target['uuid']}.0")
+        if os.path.isfile(raw):
+            with open(raw, "rb") as f:
+                return f.read()
+    with open(target["mxl"], "rb") as f:
+        return f.read()
+
+
+def read_template(dir_path: str, object_path: str = "", template_name: str = None) -> dict:
+    """Прочитать табличный документ (MXL) макета в структурированном виде.
+
+    Декодирует MOXCEL в дерево (позиционная структура) и возвращает канонический
+    текст (`structure`) + список текстовых значений (`strings`). Только чтение.
+    """
+    from . import mxl
+    root = _require_dir(dir_path)
+    obj_dir = os.path.join(root, object_path) if object_path else root
+    if not os.path.isdir(obj_dir):
+        raise FileNotFoundError(f"Объект {object_path or '<корень>'} не найден")
+    tdir = _find_template_dir(obj_dir)
+    items = _template_items(tdir)
+    target = _pick_template(items, template_name, "чтения")
+
+    data = _read_template_bytes(root, target)
+    tree = mxl.decode(data)
+    strings = list(dict.fromkeys(mxl.iter_strings(tree)))
+    return {
+        "object_path": object_path or "<корень>",
+        "template_name": target["name"],
+        "uuid": target["uuid"],
+        "bytes": len(data),
+        "top_level_elements": len(tree) if isinstance(tree, list) else 1,
+        "strings": strings[:300],
+        "strings_count": len(strings),
+        "structure": mxl.to_text(tree),
+    }
+
+
 # --- Очистка ---
 
 def cleanup(dir_path: str = None, all: bool = False) -> dict:

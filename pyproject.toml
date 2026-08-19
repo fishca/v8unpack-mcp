@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "v8unpack-mcp"
+version = "0.2.0"
+description = "MCP-сервер для полного цикла работы с бинарными файлами 1С без EDT (unpack → чтение/правка → repack → cleanup)"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "mcp>=2.0",
+    "tqdm>=4",
+]
+
+[project.scripts]
+v8unpack-mcp = "v8unpack_mcp.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

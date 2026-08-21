@@ -48,9 +48,20 @@ def get_metadata(dir_path: str, object_path: str = "", detail: bool = False) -> 
 
 @mcp.tool(description="Прочитать BSL-модуль объекта из распакованного каталога. "
                       "object_path — путь к объекту ('' для корня epf/erf, 'CommonModule/Имя' для cf/cfe); "
-                      "module_name — подстрока имени файла модуля (пусто = список модулей объекта)")
-def read_module(dir_path: str, object_path: str = "", module_name: str = "") -> str:
-    return _dump(core.read_module(dir_path, object_path, module_name or None))
+                      "module_name — подстрока имени файла модуля (пусто = список модулей объекта); "
+                      "ranges — список диапазонов строк вида 'start-end' (или 'N'), 1-based, "
+                      "суммарно не более 400 строк на пакет (пусто = весь модуль)")
+def read_module(dir_path: str, object_path: str = "", module_name: str = "",
+                ranges: list = None) -> str:
+    return _dump(core.read_module(dir_path, object_path, module_name or None, ranges))
+
+
+@mcp.tool(description="Структура BSL-модуля: объявления переменных (Перем), процедуры и функции "
+                      "(имя, вид, Экспорт, директивы, докстринг, параметры, start/end строки) и "
+                      "секция основной программы (код после процедур). object_path — путь к объекту, "
+                      "module_name — подстрока имени файла модуля")
+def get_module_structure(dir_path: str, object_path: str = "", module_name: str = "") -> str:
+    return _dump(core.get_module_structure(dir_path, object_path, module_name or None))
 
 
 @mcp.tool(description="Разобрать байт-код закрытого модуля (методы, константы, поток опкодов) "
@@ -61,10 +72,13 @@ def read_bytecode(dir_path: str, object_path: str = "") -> str:
 
 @mcp.tool(description="Поиск подстроки/regex по текстовым слоям распакованного каталога. "
                       "layers: modules, forms, templates_text, templates_html, dcc (пусто = все). "
-                      "Каждое совпадение содержит поле layer")
+                      "scope (для СКД, слой dcc): 'query' (по умолчанию, только тексты запросов) "
+                      "или 'all' (весь XML СКД). Каждое совпадение содержит поле layer")
 def search_code(dir_path: str, pattern: str, regex: bool = False,
-                case_sensitive: bool = False, max_results: int = 200, layers: list = None) -> str:
-    return _dump(core.search_code(dir_path, pattern, regex, case_sensitive, max_results, layers))
+                case_sensitive: bool = False, max_results: int = 200, layers: list = None,
+                scope: str = "query") -> str:
+    return _dump(core.search_code(dir_path, pattern, regex, case_sensitive, max_results, layers,
+                                  scope))
 
 
 @mcp.tool(description="Записать справочную информацию (help) объекта в raw-слой каталога unpack "
@@ -73,6 +87,13 @@ def search_code(dir_path: str, pattern: str, regex: bool = False,
 def set_help(dir_path: str, object_path: str = "", help_html: str = "",
              overwrite: bool = False) -> str:
     return _dump(core.set_help(dir_path, object_path, help_html, overwrite))
+
+
+@mcp.tool(description="Прочитать справочную информацию (help) объекта из raw-слоя каталога unpack. "
+                      "object_path пуст для внешней обработки/отчёта, 'Тип/Имя' для конфигурации/расширения. "
+                      "mode='check' — только факт наличия справки; mode='get' — ещё и текст (HTML) + языки")
+def get_help(dir_path: str, object_path: str = "", mode: str = "get") -> str:
+    return _dump(core.get_help(dir_path, object_path, mode))
 
 
 @mcp.tool(description="Импортировать готовый .mxl (табличный документ) в макет объекта — "
@@ -88,6 +109,34 @@ def import_template(dir_path: str, object_path: str = "", template_path: str = "
                       "список текстовых значений strings. Только чтение")
 def read_template(dir_path: str, object_path: str = "", template_name: str = "") -> str:
     return _dump(core.read_template(dir_path, object_path, template_name or None))
+
+
+@mcp.tool(description="Прочитать схему компоновки данных (СКД) макета. Уровень 1 (без "
+                      "data_set/variant) — обзор: data_sets (имя/тип), parameters, variants "
+                      "(имя/представление). data_set='Имя' — текст запроса и список полей набора. "
+                      "variant='Имя' — сырой XML настроек варианта (как хранится в .bin). Только чтение")
+def read_dcs(dir_path: str, object_path: str = "", template_name: str = "",
+             data_set: str = "", variant: str = "") -> str:
+    return _dump(core.read_dcs(dir_path, object_path, template_name or None,
+                               data_set or None, variant or None))
+
+
+@mcp.tool(description="Выгрузить СКД макета целиком в XML (штатный формат платформы: "
+                      "<DataCompositionSchema>). output_path — куда записать файл; не задан — "
+                      "XML возвращается в поле 'xml'. Только чтение")
+def export_dcs(dir_path: str, object_path: str = "", template_name: str = "",
+               output_path: str = "") -> str:
+    return _dump(core.export_dcs(dir_path, object_path, template_name or None,
+                                 output_path or None))
+
+
+@mcp.tool(description="Загрузить СКД макета целиком из XML (штатный формат платформы). "
+                      "Источник: template_path (файл) или xml_text (строка). Пишет в raw-слой; "
+                      "сборку выполняет repack")
+def import_dcs(dir_path: str, object_path: str = "", template_path: str = "",
+               template_name: str = "", xml_text: str = "") -> str:
+    return _dump(core.import_dcs(dir_path, object_path, template_path or None,
+                                 template_name or None, xml_text or None))
 
 
 @mcp.tool(description="Сравнить два распакованных каталога (результат unpack) пообъектно. "

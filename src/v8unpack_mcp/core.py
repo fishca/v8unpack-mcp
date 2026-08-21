@@ -310,7 +310,70 @@ def _find_module_files(obj_dir: str) -> list:
     return sorted(modules)
 
 
-def read_module(dir_path: str, object_path: str = "", module_name: str = ""):
+def _module_files(root: str, object_path: str):
+    """Каталог объекта и список его модульных файлов (или FileNotFoundError)."""
+    obj_dir = os.path.join(root, object_path) if object_path else root
+    if not os.path.isdir(obj_dir):
+        raise FileNotFoundError(f"Объект {object_path or '<корень>'} не найден")
+    return obj_dir, _find_module_files(obj_dir)
+
+
+def _select_module(modules: list, module_name: str, object_path: str):
+    """Выбрать один модуль по подстроке имени файла (или None, если module_name пуст)."""
+    if not module_name:
+        return None
+    for rel, full in modules:
+        if module_name in rel:
+            return (rel, full)
+    raise FileNotFoundError(f"Модуль {module_name} не найден в {object_path or '<корень>'}")
+
+
+# Максимум строк в одном пакете чтения диапазонов.
+MAX_RANGE_LINES = 400
+
+
+def _parse_range(spec, n_lines: int):
+    """Разобрать диапазон 'start-end' (или 'N', или [start, end]) в 1-based границы."""
+    if isinstance(spec, (list, tuple)):
+        if len(spec) != 2:
+            raise ValueError(f"Диапазон должен быть 'start-end' или [start, end], получено: {spec!r}")
+        start, end = int(spec[0]), int(spec[1])
+    else:
+        s = str(spec).strip()
+        if "-" in s:
+            a, b = s.split("-", 1)
+            start, end = int(a.strip()), int(b.strip())
+        else:
+            start = end = int(s)
+    if start < 1 or end < start or end > n_lines:
+        raise ValueError(f"Диапазон {spec!r} вне границ модуля (1..{n_lines})")
+    return start, end
+
+
+def _apply_ranges(lines: list, ranges):
+    """Применить диапазоны строк к тексту модуля, ограничив пакет MAX_RANGE_LINES строками.
+
+    Возвращает список сегментов [{start_line, end_line, lines}]. При превышении лимита
+    поднимает ValueError (агент должен разбить запрос на несколько вызовов).
+    """
+    segments = []
+    total = 0
+    for spec in ranges:
+        start, end = _parse_range(spec, len(lines))
+        total += end - start + 1
+        segments.append((start, end))
+    if total > MAX_RANGE_LINES:
+        raise ValueError(
+            f"Суммарно {total} строк в запрошенных диапазонах превышает лимит "
+            f"{MAX_RANGE_LINES} строк на пакет — разбейте на несколько вызовов"
+        )
+    return [
+        {"start_line": start, "end_line": end, "lines": lines[start - 1:end]}
+        for start, end in segments
+    ]
+
+
+def read_module(dir_path: str, object_path: str = "", module_name: str = "", ranges=None):
     """Прочитать BSL-модуль объекта из распакованного каталога.
 
     `object_path` — путь к объекту относительно корня распаковки ("" для корневого
@@ -318,12 +381,13 @@ def read_module(dir_path: str, object_path: str = "", module_name: str = ""):
 
     Без module_name — вернуть список модулей объекта (имя + вид).
     С module_name — вернуть содержимое выбранного модуля (подстрока имени файла).
+
+    ranges — список диапазонов строк вида "start-end" (или "N", или [start, end]),
+    1-based включительно. Если задан, вместо полного содержимого возвращаются только
+    эти диапазоны; суммарно не более 400 строк на пакет.
     """
     root = _require_dir(dir_path)
-    obj_dir = os.path.join(root, object_path) if object_path else root
-    if not os.path.isdir(obj_dir):
-        raise FileNotFoundError(f"Объект {object_path or '<корень>'} не найден")
-    modules = _find_module_files(obj_dir)
+    _obj_dir, modules = _module_files(root, object_path)
     if not modules:
         return {"object": object_path or "<корень>", "modules": []}
 
@@ -334,14 +398,7 @@ def read_module(dir_path: str, object_path: str = "", module_name: str = ""):
             listing.append({"name": rel, "kind": kind})
         return {"object": object_path or "<корень>", "modules": listing}
 
-    target = None
-    for rel, full in modules:
-        if module_name in rel:
-            target = (rel, full)
-            break
-    if target is None:
-        raise FileNotFoundError(f"Модуль {module_name} не найден в {object_path or '<корень>'}")
-
+    target = _select_module(modules, module_name, object_path)
     rel, full = target
     with open(full, "rb") as f:
         data = f.read()
@@ -355,13 +412,61 @@ def read_module(dir_path: str, object_path: str = "", module_name: str = ""):
             "note": "Модуль защищён (зашифрован). Исходник без пароля не восстановить.",
         }
     from .textlayers import decode_text
-    return {
+    content = decode_text(data)
+    result = {
         "object": object_path or "<корень>",
         "module": rel,
         "kind": "bsl",
         "encoding": "utf-8-sig",
-        "content": decode_text(data),
+        "total_lines": len(content.splitlines()),
     }
+    if ranges:
+        result["ranges"] = _apply_ranges(content.splitlines(), ranges)
+        result["total_returned_lines"] = sum(len(r["lines"]) for r in result["ranges"])
+    else:
+        result["content"] = content
+    return result
+
+
+def get_module_structure(dir_path: str, object_path: str = "", module_name: str = ""):
+    """Структура BSL-модуля: переменные, процедуры/функции, основная программа.
+
+    Возвращает:
+      variables  — объявления `Перем` (имя, Экспорт, строка);
+      procedures — процедуры и функции (имя, вид, Экспорт, директивы, докстринг,
+                   параметры с Знач/значением по умолчанию, start_line/end_line);
+      main       — секция «основной программы» (код после процедур) с позициями и текстом.
+    Без module_name — список модулей объекта (как у read_module).
+    """
+    root = _require_dir(dir_path)
+    _obj_dir, modules = _module_files(root, object_path)
+    if not modules:
+        return {"object": object_path or "<корень>", "modules": []}
+
+    if not module_name:
+        listing = []
+        for rel, full in modules:
+            kind = "encrypted" if rel.endswith(".obj.bin") else "bsl"
+            listing.append({"name": rel, "kind": kind})
+        return {"object": object_path or "<корень>", "modules": listing}
+
+    rel, full = _select_module(modules, module_name, object_path)
+    if rel.endswith(".obj.bin"):
+        return {
+            "object": object_path or "<корень>",
+            "module": rel,
+            "kind": "encrypted",
+            "note": "Модуль защищён (зашифрован) — структура исходника недоступна.",
+        }
+    from .textlayers import decode_text
+    with open(full, "rb") as f:
+        content = decode_text(f.read())
+    from . import bsl
+    structure = bsl.parse_module(content)
+    structure["object"] = object_path or "<корень>"
+    structure["module"] = rel
+    structure["kind"] = "bsl"
+    return structure
 
 
 def read_bytecode(dir_path: str, object_path: str = ""):
@@ -402,21 +507,27 @@ def _find_matches(text: str, pattern: str, regex: bool, case_sensitive: bool, ma
 
 
 def search_code(dir_path: str, pattern: str, regex: bool = False,
-                case_sensitive: bool = False, max_results: int = 200, layers=None):
+                case_sensitive: bool = False, max_results: int = 200, layers=None,
+                scope: str = "query"):
     """Поиск по текстовым слоям одного распакованного каталога.
 
     layers — список областей поиска: modules, forms, templates_text, templates_html,
     dcc. Пусто/None → все. Каждое совпадение получает поле "layer".
+    scope — область поиска внутри СКД (слой dcc): 'query' (по умолчанию, только тексты
+    запросов) или 'all' (весь XML СКД). На остальные слои не влияет.
     Возвращает {"matches": [...], "truncated": bool}.
     """
     if not pattern:
         return {"matches": [], "truncated": False}
+    if scope not in ("query", "all"):
+        raise ValueError(f"Неизвестная область поиска СКД: {scope!r}. Допустимые: ['query', 'all']")
+    dcc_scope = None if scope == "all" else scope
     from .textlayers import iter_searchable_files, normalize_layers
     root = _require_dir(dir_path)
     wanted = normalize_layers(layers)
     matches = []
     truncated = False
-    for rel, text, layer in iter_searchable_files(root, wanted):
+    for rel, text, layer in iter_searchable_files(root, wanted, dcc_scope):
         found = _find_matches(text, pattern, regex, case_sensitive, max_per_file=max_results - len(matches))
         for m in found:
             matches.append({
@@ -591,6 +702,91 @@ def set_help(dir_path: str, object_path: str = "", help_html: str = "",
     }
 
 
+def _decode_help_blobs(data):
+    """Извлечь языки и тексты справки из декодированного brace-файла help.
+
+    Структура: data[0][2] — языки ("ru" или ["ru","en"]), data[0][3] — base64-блобы
+    ("#base64:" есть данные, "##base64:" пусто, "#data:" тоже возможно).
+    Возвращает (languages: list[str], texts: list[str]).
+    """
+    languages = []
+    texts = []
+    try:
+        row = data[0]
+    except (IndexError, TypeError):
+        return languages, texts
+    if len(row) > 2:
+        lang = row[2]
+        if isinstance(lang, list):
+            languages = [str(x).strip('"') for x in lang]
+        elif lang:
+            languages = [str(lang).strip('"')]
+    if len(row) > 3:
+        blobs = row[3]
+        if isinstance(blobs, str):
+            blobs = [blobs]
+        if isinstance(blobs, list):
+            for b in blobs:
+                s = str(b)
+                if s.startswith("#base64:"):
+                    try:
+                        texts.append(base64.b64decode(s[8:]).decode("utf-8"))
+                    except (ValueError, UnicodeDecodeError):
+                        texts.append(None)
+                elif s.startswith("#data:"):
+                    try:
+                        texts.append(base64.b64decode(s[6:]).decode("utf-8"))
+                    except (ValueError, UnicodeDecodeError):
+                        texts.append(None)
+                elif s.startswith("##base64:"):
+                    texts.append("")
+    return languages, texts
+
+
+def get_help(dir_path: str, object_path: str = "", mode: str = "get") -> dict:
+    """Прочитать справочную информацию (help) объекта из raw-слоя каталога unpack.
+
+    - object_path: пусто — для внешней обработки/отчёта (сам объект);
+      'Тип/Имя' — для объекта конфигурации/расширения.
+    - mode='check' — только факт наличия справки (+ uuid/тип/файл/размер);
+      mode='get' — дополнительно текст справки (base64-HTML) и список языков.
+    """
+    root = _require_dir(dir_path)
+    if mode not in ("check", "get"):
+        raise ValueError(f"mode должен быть 'check' или 'get', получено: {mode!r}")
+
+    obj_uuid, meta_type = _resolve_help_target(root, object_path)
+    help_num = _help_file_number(meta_type)
+    if help_num is None:
+        raise ValueError(f"Тип '{meta_type}' не поддерживает справочную информацию (object_path={object_path or '(корень)'})")
+
+    d0 = os.path.join(root, RAW_DIR, "0")
+    help_file = f"{obj_uuid}.{help_num}"
+    help_file_path = os.path.join(d0, help_file)
+
+    result = {
+        "exists": os.path.isfile(help_file_path),
+        "object_path": object_path or "(корень)",
+        "meta_type": meta_type,
+        "uuid": obj_uuid,
+        "help_file": help_file,
+    }
+    if not result["exists"]:
+        return result
+
+    result["bytes"] = os.path.getsize(help_file_path)
+    if mode == "check":
+        return result
+
+    data = v8helper.brace_file_read(d0, help_file)
+    languages, texts = _decode_help_blobs(data)
+    result["languages"] = languages
+    result["texts"] = texts
+    if texts:
+        result["text"] = texts[0]
+    return result
+
+
 # --- Макеты (табличные документы MXL) ---
 
 def _find_template_dir(obj_dir: str) -> str:
@@ -758,6 +954,183 @@ def read_template(dir_path: str, object_path: str = "", template_name: str = Non
         "strings": strings[:300],
         "strings_count": len(strings),
         "structure": mxl.to_text(tree),
+    }
+
+
+# --- Макеты (схемы компоновки данных СКД) ---
+
+def _find_dcs_templates(template_dir: str) -> list:
+    """СКД-макеты (type='scheme') в каталоге макетов: [{name, dir, bin, uuid, type}].
+
+    СКД-макет определяется наличием Template.bin + Template.json с type='scheme'
+    (в отличие от табличного макета с Template.mxl).
+    """
+    items = []
+    for entry in sorted(os.listdir(template_dir)):
+        p = os.path.join(template_dir, entry)
+        if not os.path.isdir(p):
+            continue
+        bin_file = os.path.join(p, "Template.bin")
+        if not os.path.isfile(bin_file):
+            continue
+        ttype = None
+        tjson = os.path.join(p, "Template.json")
+        if os.path.isfile(tjson):
+            try:
+                ttype = json.load(open(tjson, encoding="utf-8")).get("type")
+            except (OSError, ValueError):
+                pass
+        if ttype and ttype != "scheme":
+            continue
+        uuid = None
+        idjson = os.path.join(p, "Template.id.json")
+        if os.path.isfile(idjson):
+            try:
+                uuid = json.load(open(idjson, encoding="utf-8")).get("uuid")
+            except (OSError, ValueError):
+                pass
+        items.append({"name": entry, "dir": p, "bin": bin_file, "uuid": uuid, "type": ttype or "scheme"})
+    return items
+
+
+def _read_dcs_bytes(root: str, target: dict) -> bytes:
+    """Содержимое СКД-макета: из raw-слоя (актуально после import), иначе organized .bin."""
+    if target.get("uuid"):
+        raw = os.path.join(root, RAW_DIR, "0", f"{target['uuid']}.0")
+        if os.path.isfile(raw):
+            with open(raw, "rb") as f:
+                return f.read()
+    with open(target["bin"], "rb") as f:
+        return f.read()
+
+
+def read_dcs(dir_path: str, object_path: str = "", template_name: str = None,
+             data_set: str = None, variant: str = None) -> dict:
+    """Прочитать схему компоновки данных (СКД) макета.
+
+    Без data_set и variant — уровень 1 (обзор): data_sets (имя/тип), parameters,
+    variants (имя/представление).
+    data_set='Имя' — уровень 2: текст запроса и список полей набора.
+    variant='Имя'  — уровень 2: сырой XML настроек варианта (как хранится в .bin).
+    """
+    from . import dcs
+    root = _require_dir(dir_path)
+    obj_dir = os.path.join(root, object_path) if object_path else root
+    if not os.path.isdir(obj_dir):
+        raise FileNotFoundError(f"Объект {object_path or '<корень>'} не найден")
+    tdir = _find_template_dir(obj_dir)
+    items = _find_dcs_templates(tdir)
+    target = _pick_template(items, template_name, "чтения СКД")
+
+    data = _read_dcs_bytes(root, target)
+    parsed = dcs.load(data)
+    schema = parsed["schema"]
+
+    result = {
+        "object_path": object_path or "<корень>",
+        "template_name": target["name"],
+        "uuid": target["uuid"],
+        "bytes": len(data),
+        "overview": dcs.overview(schema),
+        "variants_count": len(parsed["settings"]),
+    }
+
+    if data_set:
+        result["data_set"] = dcs.dataset_detail(schema, data_set)
+
+    if variant:
+        names = [v["name"] for v in dcs.variants(schema)]
+        try:
+            idx = names.index(variant)
+        except ValueError:
+            raise ValueError(f"Вариант '{variant}' не найден; варианты: {names}")
+        result["variant"] = variant
+        result["variant_xml"] = parsed["settings"][idx]
+
+    return result
+
+
+def export_dcs(dir_path: str, object_path: str = "", template_name: str = None,
+               output_path: str = None) -> dict:
+    """Выгрузить СКД макета в XML в штатном формате платформы.
+
+    output_path — куда записать файл. Не задан — XML возвращается в поле 'xml'.
+    """
+    from . import dcs
+    root = _require_dir(dir_path)
+    obj_dir = os.path.join(root, object_path) if object_path else root
+    if not os.path.isdir(obj_dir):
+        raise FileNotFoundError(f"Объект {object_path or '<корень>'} не найден")
+    tdir = _find_template_dir(obj_dir)
+    items = _find_dcs_templates(tdir)
+    target = _pick_template(items, template_name, "выгрузки СКД")
+
+    data = _read_dcs_bytes(root, target)
+    xml = dcs.export_xml(data)
+
+    result = {
+        "object_path": object_path or "<корень>",
+        "template_name": target["name"],
+        "uuid": target["uuid"],
+        "source_bytes": len(data),
+    }
+    if output_path:
+        output_path = os.path.abspath(output_path)
+        parent = os.path.dirname(output_path)
+        if not os.path.isdir(parent):
+            raise FileNotFoundError(f"Каталог назначения не существует: {parent}")
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(xml)
+        result["output"] = output_path
+        result["xml_bytes"] = os.path.getsize(output_path)
+    else:
+        result["xml"] = xml
+    return result
+
+
+def import_dcs(dir_path: str, object_path: str = "", template_path: str = "",
+               template_name: str = None, xml_text: str = None) -> dict:
+    """Загрузить СКД макета из XML (штатный формат платформы) — запись в raw-слой.
+
+    Источник XML: template_path (файл) или xml_text (строка). Сборку выполняет repack.
+    """
+    from . import dcs
+    root = _require_dir(dir_path)
+
+    if template_path:
+        template_path = os.path.abspath(template_path)
+        if not os.path.isfile(template_path):
+            raise FileNotFoundError(template_path)
+        with open(template_path, "r", encoding="utf-8-sig") as f:
+            xml_text = f.read()
+    if not xml_text:
+        raise ValueError("Укажите template_path или xml_text")
+
+    bin_data = dcs.build_bin(xml_text)
+
+    obj_dir = os.path.join(root, object_path) if object_path else root
+    if not os.path.isdir(obj_dir):
+        raise FileNotFoundError(f"Объект {object_path or '<корень>'} не найден")
+    tdir = _find_template_dir(obj_dir)
+    items = _find_dcs_templates(tdir)
+    target = _pick_template(items, template_name, "загрузки СКД")
+
+    if not target["uuid"]:
+        raise ValueError(f"У макета '{target['name']}' не определён uuid (нет Template.id.json)")
+    d0 = os.path.join(root, RAW_DIR, "0")
+    if not os.path.isdir(d0):
+        raise FileNotFoundError(f"В каталоге нет raw-слоя {RAW_DIR}/0 — unpack должен выполняться с keep_raw")
+    raw_file = os.path.join(d0, f"{target['uuid']}.0")
+    with open(raw_file, "wb") as f:
+        f.write(bin_data)
+    return {
+        "ok": True,
+        "object_path": object_path or "<корень>",
+        "template_name": target["name"],
+        "uuid": target["uuid"],
+        "raw_file": raw_file,
+        "bytes": len(bin_data),
+        "note": "Записано в raw-слой (.v8unpack_raw/0/<uuid>.0); repack возьмёт его без полной пересборки.",
     }
 
 

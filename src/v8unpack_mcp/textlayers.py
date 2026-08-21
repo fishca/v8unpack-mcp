@@ -49,17 +49,43 @@ def extract_xml_from_bin(data: bytes):
     return decode_text(data[idx:])
 
 
+def extract_dcs_queries(data: bytes):
+    """Тексты запросов СКД (содержимое `<query>`), склеенные — для поиска по области query.
+
+    Возвращает None, если `.bin` не является СКД (нет ни одного `<query>`).
+    Текст декодируется через XML-парсер, поэтому `&lt;`/`&amp;` и т.п. раскрываются.
+    """
+    from . import dcs
+    try:
+        parsed = dcs.load(data)
+    except Exception:
+        return None
+    parts = []
+    for ds in parsed["schema"]:
+        if dcs._local(ds.tag) != "dataSet":
+            continue
+        q = dcs._child(ds, "query")
+        if q is not None and q.text:
+            parts.append(q.text)
+    return "\n\n".join(parts) if parts else None
+
+
 def is_text_layer(filename: str) -> bool:
     ext = os.path.splitext(filename)[1].lower()
     return ext in SEARCHABLE_EXTENSIONS
 
 
-def layer_text(filename: str, data: bytes):
-    """Вернуть текст слоя или None, если слой бинарный/неизвлекаемый."""
+def layer_text(filename: str, data: bytes, dcc_scope: str = None):
+    """Вернуть текст слоя или None, если слой бинарный/неизвлекаемый.
+
+    dcc_scope — область СКД: 'query' (только тексты запросов) или None (весь XML).
+    """
     ext = os.path.splitext(filename)[1].lower()
     if ext in SEARCHABLE_EXTENSIONS:
         return decode_text(data)
     if ext == ".bin":
+        if dcc_scope == "query":
+            return extract_dcs_queries(data)
         return extract_xml_from_bin(data)
     return None
 
@@ -84,10 +110,11 @@ def normalize_layers(layers):
     return wanted
 
 
-def iter_searchable_files(root: str, layers=None):
+def iter_searchable_files(root: str, layers=None, dcc_scope: str = None):
     """Обход дерева, отдаём (относительный_путь, текст, имя_слоя).
 
     layers — список имён областей поиска (см. ALL_LAYERS); пусто/None — все.
+    dcc_scope — для слоя dcc: 'query' (только запросы) или None (весь XML).
     """
     wanted = normalize_layers(layers)
     for dirpath, dirnames, filenames in os.walk(root):
@@ -105,6 +132,6 @@ def iter_searchable_files(root: str, layers=None):
                     data = f.read()
             except OSError:
                 continue
-            text = layer_text(fn, data)
+            text = layer_text(fn, data, dcc_scope)
             if text is not None:
                 yield rel, text, layer

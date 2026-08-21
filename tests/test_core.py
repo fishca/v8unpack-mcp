@@ -62,6 +62,59 @@ def test_read_module_plain():
         core.cleanup(d)
 
 
+def test_get_module_structure():
+    d = _unpack(CFE)
+    try:
+        s = core.get_module_structure(d, "CommonModule/ПодборТоваровСервер", "CommonModule")
+        assert s["kind"] == "bsl"
+        assert s["total_lines"] > 0
+        assert len(s["procedures"]) >= 1
+        for p in s["procedures"]:
+            assert p["name"] and p["kind"] in ("Процедура", "Функция")
+            assert p["start_line"] >= 1 and p["end_line"] >= p["start_line"]
+            assert isinstance(p["params"], list) and "docstring" in p
+        assert any(p["kind"] == "Функция" for p in s["procedures"])
+        assert any(p["params"] for p in s["procedures"])
+    finally:
+        core.cleanup(d)
+
+
+def test_read_module_ranges():
+    d = _unpack(CFE)
+    try:
+        r = core.read_module(d, "CommonModule/ПодборТоваровСервер", "CommonModule",
+                             ranges=["1-5", "10-12"])
+        assert "ranges" in r and "content" not in r
+        assert len(r["ranges"]) == 2
+        assert r["total_returned_lines"] == 8
+        seg = r["ranges"][0]
+        assert seg["start_line"] == 1 and seg["end_line"] == 5 and len(seg["lines"]) == 5
+    finally:
+        core.cleanup(d)
+
+
+def test_read_module_ranges_limit():
+    lines = ["x"] * 500
+    try:
+        core._apply_ranges(lines, ["1-300", "301-500"])
+    except ValueError:
+        return
+    raise AssertionError("ожидался ValueError при превышении лимита 400 строк")
+
+
+def test_read_module_ranges_out_of_bounds():
+    d = _unpack(CFE)
+    try:
+        try:
+            core.read_module(d, "CommonModule/ПодборТоваровСервер", "CommonModule",
+                             ranges=["1-9999"])
+        except ValueError:
+            return
+        raise AssertionError("ожидался ValueError при диапазоне вне границ модуля")
+    finally:
+        core.cleanup(d)
+
+
 def test_search_code_bsl():
     d = _unpack(CFE)
     try:
@@ -73,10 +126,10 @@ def test_search_code_bsl():
 
 
 def test_search_code_skd_xml():
-    # СКД лежит в Template.bin (бинарный префикс + XML) — текст запроса должен искаться.
+    # СКД лежит в Template.bin (бинарный префикс + XML). scope='all' ищет по всему XML.
     d = _unpack(CFE)
     try:
-        res = core.search_code(d, "dataCompositionSchema", max_results=10)
+        res = core.search_code(d, "dataCompositionSchema", max_results=10, scope="all")
         assert len(res["matches"]) > 0
         assert any("Template.bin" in m["path"] for m in res["matches"])
     finally:
@@ -140,6 +193,21 @@ def test_set_help_edit_and_repack():
         shutil.rmtree(d, ignore_errors=True)
         if os.path.isfile(out):
             os.remove(out)
+
+
+def test_get_help_check_and_get():
+    d = _unpack(EPF)
+    try:
+        chk = core.get_help(d, "", "check")
+        assert chk["exists"] is True
+        assert chk["meta_type"] == "ExternalDataProcessor"
+        assert chk["uuid"] and chk["bytes"] > 0
+        got = core.get_help(d, "", "get")
+        assert got["exists"] is True
+        assert got["languages"] == ["ru"]
+        assert got["text"] and "<html>" in got["text"]
+    finally:
+        core.cleanup(d)
 
 
 def _cfe_table_mxls(d):

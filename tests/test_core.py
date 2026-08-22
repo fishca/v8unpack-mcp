@@ -179,6 +179,81 @@ def test_unpack_repack_roundtrip():
             os.remove(out)
 
 
+def _wait_done(job_id, timeout=120):
+    """Опрашивать job_status до status=done/error или таймаута."""
+    import time
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        st = core.job_status(job_id)
+        if st["status"] in ("done", "error"):
+            return st
+        time.sleep(0.05)
+    raise TimeoutError(f"Задание {job_id} не завершилось за {timeout}с")
+
+
+def test_unpack_async_returns_job_and_done():
+    s = core.start_unpack(EPF)
+    assert s["status"] == "running"
+    assert s["job_id"]
+    st = _wait_done(s["job_id"])
+    assert st["status"] == "done"
+    assert st["error"] is None
+    assert st["result"]["status"] == "ok"
+    assert os.path.isdir(st["result"]["dir"])
+    try:
+        assert "ExternalDataProcessor.obj.bsl" in os.listdir(st["result"]["dir"])
+    finally:
+        core.cleanup(st["result"]["dir"])
+
+
+def test_unpack_async_missing_file_raises():
+    try:
+        core.start_unpack(os.path.join(TESTDATA, "нет_такого.epf"))
+        assert False, "должно быть FileNotFoundError"
+    except FileNotFoundError:
+        pass
+
+
+def test_unpack_async_bad_extension():
+    bad = os.path.join(tempfile.gettempdir(), "v8unpack_mcp_not_1c.txt")
+    with open(bad, "w", encoding="utf-8") as f:
+        f.write("x")
+    try:
+        try:
+            core.start_unpack(bad)
+            assert False, "должно быть ValueError"
+        except ValueError:
+            pass
+    finally:
+        if os.path.isfile(bad):
+            os.remove(bad)
+
+
+def test_repack_async_roundtrip():
+    d = _unpack(EPF)
+    out = os.path.join(tempfile.gettempdir(), "v8unpack_mcp_async_roundtrip.epf")
+    try:
+        s = core.start_repack(d, out)
+        assert s["status"] == "running"
+        st = _wait_done(s["job_id"])
+        assert st["status"] == "done"
+        assert st["error"] is None
+        assert st["result"]["status"] == "ok"
+        assert os.path.isfile(out) and os.path.getsize(out) > 0
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+        if os.path.isfile(out):
+            os.remove(out)
+
+
+def test_job_status_unknown_job():
+    try:
+        core.job_status("job-999999")
+        assert False, "должно быть KeyError"
+    except KeyError:
+        pass
+
+
 def test_set_help_edit_and_repack():
     d = _unpack(EPF)
     out = os.path.join(tempfile.gettempdir(), "v8unpack_mcp_help.epf")

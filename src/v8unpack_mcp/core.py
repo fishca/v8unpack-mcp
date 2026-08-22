@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 import uuid as uuid_mod
 
 from v8unpack import extract, build
@@ -35,6 +36,7 @@ class _SerialPool:
     def imap_unordered(self, method, list_args, chunksize=1):
         for args in list_args:
             yield method(args)
+            _tick_job_progress()
 
     def close(self):
         pass
@@ -45,6 +47,25 @@ class _SerialPool:
 
 _SERIAL_POOL = _SerialPool()
 _original_get_pool = v8helper.get_pool
+
+
+# Прогресс по активному заданию: threading.local, чтобы несколько фоновых заданий
+# (каждое в своём потоке) не смешивали счётчики, пока v8unpack гоняет серийный пул.
+_POOL_LOCAL = threading.local()
+
+
+def _set_active_job(job_id: str) -> None:
+    _POOL_LOCAL.job_id = job_id
+
+
+def _tick_job_progress() -> None:
+    job_id = getattr(_POOL_LOCAL, "job_id", None)
+    if not job_id:
+        return
+    with _JOB_LOCK:
+        job = _JOBS.get(job_id)
+        if job is not None:
+            job["progress"] = job.get("progress", 0) + 1
 
 
 def _serial_get_pool(*, pool=None, processes=None):
@@ -87,6 +108,124 @@ def _require_dir(dir_path: str) -> str:
     if not os.path.isdir(dir_path):
         raise FileNotFoundError(f"Каталог не найден: {dir_path}")
     return dir_path
+
+
+# --- Асинхронные задания (unpack/repack в фоновом потоке) ---
+
+_JOB_LOCK = threading.Lock()
+_JOBS = {}
+_JOB_COUNTER = 0
+
+_STATUS_RUNNING = "running"
+_STATUS_DONE = "done"
+_STATUS_ERROR = "error"
+
+
+def _new_job_id() -> str:
+    global _JOB_COUNTER
+    with _JOB_LOCK:
+        _JOB_COUNTER += 1
+        return f"job-{_JOB_COUNTER}"
+
+
+def _run_job(job_id: str, fn, args: tuple) -> None:
+    """Исполнить фоновое задание и записать результат/ошибку в реестр."""
+    _set_active_job(job_id)
+    try:
+        result = fn(*args)
+    except Exception as err:
+        with _JOB_LOCK:
+            job = _JOBS.get(job_id)
+            if job is not None:
+                job["status"] = _STATUS_ERROR
+                job["error"] = f"{type(err).__name__}: {err}"
+        return
+    with _JOB_LOCK:
+        job = _JOBS.get(job_id)
+        if job is not None:
+            job["status"] = _STATUS_DONE
+            job["result"] = result
+
+
+def _spawn_job(kind: str, fn, args: tuple) -> dict:
+    job_id = _new_job_id()
+    with _JOB_LOCK:
+        _JOBS[job_id] = {
+            "id": job_id,
+            "kind": kind,
+            "status": _STATUS_RUNNING,
+            "progress": 0,
+            "result": None,
+            "error": None,
+        }
+    threading.Thread(target=_run_job, args=(job_id, fn, args), daemon=True).start()
+    return {"job_id": job_id, "status": _STATUS_RUNNING}
+
+
+def start_unpack(file_path: str) -> dict:
+    """Запустить распаковку в фоновом задании. Возвращает {job_id, status:"running"}.
+
+    Проверка пути/типа выполняется синхронно (мгновенно), сама распаковка — в фоне;
+    результат опрашивается через `job_status`. См. `unpack` для смысла возврата.
+    """
+    file_path = os.path.abspath(file_path)
+    if not os.path.isfile(file_path):
+        raise FileNotFoundError(file_path)
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext not in SUPPORTED_EXTENSIONS:
+        raise ValueError(f"Неподдерживаемый тип файла: {ext!r} (ожидается .cf/.cfe/.epf/.erf)")
+    out_dir = tempfile.mkdtemp(prefix=_UNPACK_PREFIX)
+    return _spawn_job("unpack", _do_unpack, (file_path, out_dir))
+
+
+def _do_unpack(file_path: str, out_dir: str) -> dict:
+    _extract_silent(file_path, out_dir, options={"keep_raw": True})
+    return {
+        "status": "ok",
+        "dir": out_dir,
+        "file": _file_info(file_path),
+        "kind": _meta_kind_dir(out_dir),
+    }
+
+
+def start_repack(dir_path: str, output_path: str) -> dict:
+    """Запустить сборку в фоновом задании. Возвращает {job_id, status:"running"}."""
+    dir_path = _require_dir(dir_path)
+    output_path = os.path.abspath(output_path)
+    parent = os.path.dirname(output_path)
+    if not os.path.isdir(parent):
+        raise FileNotFoundError(f"Каталог назначения не существует: {parent}")
+    return _spawn_job("repack", _do_repack, (dir_path, output_path))
+
+
+def _do_repack(dir_path: str, output_path: str) -> dict:
+    _build_silent(dir_path, output_path, options={"use_raw": True})
+    return {
+        "status": "ok",
+        "output": output_path,
+        "bytes": os.path.getsize(output_path),
+    }
+
+
+def job_status(job_id: str) -> dict:
+    """Статус фонового задания: {status, progress, error, result}.
+
+    status: running | done | error. `result` заполняется только при status=done
+    (тот же dict, что вернули бы синхронные unpack/repack); `error` — текст при
+    status=error.
+    """
+    with _JOB_LOCK:
+        job = _JOBS.get(job_id)
+        if job is None:
+            raise KeyError(f"Задание {job_id!r} не найдено (возможно, завершено и удалено)")
+        return {
+            "id": job["id"],
+            "kind": job["kind"],
+            "status": job["status"],
+            "progress": job["progress"],
+            "result": job["result"],
+            "error": job["error"],
+        }
 
 
 # --- Инструменты ---

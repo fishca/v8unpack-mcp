@@ -28,9 +28,32 @@ def unpack(file_path: str) -> str:
     return _dump(core.unpack(file_path))
 
 
+@mcp.tool(description="АСИНХРОННАЯ распаковка крупного файла 1С. Запускает работу в фоновом "
+                      "задании и СРАЗУ возвращает {job_id, status:'running'} — не ждёт завершения, "
+                      "поэтому не срывается таймаутом клиента. Опрашивайте статус через job_status, "
+                      "пока status!='done'; в result будет тот же результат, что у unpack")
+def unpack_async(file_path: str) -> str:
+    return _dump(core.start_unpack(file_path))
+
+
+@mcp.tool(description="Статус фонового задания (unpack_async/repack_async): "
+                      "status=running|done|error, progress (число обработанных объектов), "
+                      "result (при status=done — как у unpack/repack), error (при status=error). "
+                      "Опрашивайте повторно, пока status!='done'")
+def job_status(job_id: str) -> str:
+    return _dump(core.job_status(job_id))
+
+
 @mcp.tool(description="Собрать файл 1С из распакованного каталога (результат unpack) в целевой файл")
 def repack(dir_path: str, output_path: str) -> str:
     return _dump(core.repack(dir_path, output_path))
+
+
+@mcp.tool(description="АСИНХРОННАЯ сборка файла 1С из распакованного каталога. Запускает работу "
+                      "в фоновом задании и СРАЗУ возвращает {job_id, status:'running'}. Результат "
+                      "получите через job_status (status='done', поле result)")
+def repack_async(dir_path: str, output_path: str) -> str:
+    return _dump(core.start_repack(dir_path, output_path))
 
 
 @mcp.tool(description="Список объектов внутри распакованного контейнера: {вид_объекта: [имена]} "

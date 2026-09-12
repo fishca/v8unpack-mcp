@@ -4,10 +4,11 @@ import datetime
 import io
 import math
 import os
+import re
 import tempfile
 import zlib
 from datetime import datetime, timedelta
-from struct import pack, calcsize
+from struct import pack, unpack, calcsize
 # -*- coding: utf-8 -*-
 from struct import unpack
 
@@ -60,6 +61,8 @@ class Container:
         self.default_block_size = header.default_block_size
         #: Список файлов в контейнере
         self.files = self.read_files(self.file)
+        # Файлы, записанные после TOC («журнал» атомарной дозаписи)
+        self.read_journal_files(self.file)
 
     def extract(self, dest_dir, deflate=False, recursive=False, *, progress=None):
         """
@@ -193,6 +196,80 @@ class Container:
 
             files[inner_file.name] = inner_file
         return files
+
+    def read_journal_files(self, file):
+        """Дочитывает файлы из «журнала» — цепочки блоков от first_empty_block_offset.
+
+        Встречается в контейнерах с атомарной дозаписью (напр., 1c_open_passwordv8.epf):
+        после файлов TOC в конец дописаны блоки-дескрипторы с doc_size=end_marker;
+        данные файла — блоки, записанные сразу после его дескриптора; поле next
+        каждого блока указывает на предыдущий записанный блок, поэтому цепочка
+        идёт от самого нового блока к самому старому. Так хранятся системные файлы
+        (root/version/versions) и маркер завершённой записи commit, которых может
+        не быть в TOC. Добавляются только имена, отсутствующие в TOC: TOC-копии
+        считаем более новыми (дозапись обновляет и их).
+        """
+        offset = self.first_empty_block_offset
+        if offset in (None, 0, self.end_marker):
+            return
+        chain = []
+        seen = set()
+        document = Document(self)
+        while offset != self.end_marker and offset not in seen and len(chain) < 4096:
+            block = document.read_block(file, offset)
+            if block is None or not block.data:
+                break
+            seen.add(offset)
+            chain.append(block)
+            offset = block.next_block_offset
+        if not chain:
+            return
+        groups = []
+        current = None
+        for block in reversed(chain):  # от старого блока к новому
+            descriptor = self.parse_journal_descriptor(block.data)
+            if descriptor is not None:
+                if current is not None:
+                    groups.append(current)
+                name, created, modified = descriptor
+                current = {
+                    'name': name,
+                    'created': self.parse_datetime(created),
+                    'modified': self.parse_datetime(modified),
+                    'data': [],
+                }
+            elif current is not None:
+                current['data'].append(block.data)
+        if current is not None:
+            groups.append(current)
+        for group in groups:
+            name = group['name']
+            if not name or name in self.files:
+                continue
+            data = b''.join(group['data'])
+            self.files[name] = File(name, len(data), group['created'], group['modified'], iter([data]))
+
+    @staticmethod
+    def parse_journal_descriptor(payload):
+        """Дескриптор файла в журнале: то же QQi(0) + имя UTF-16, что и в TOC-дескрипторах.
+
+        Возвращает (имя, created, modified) или None, если payload — не дескриптор.
+        """
+        if len(payload) < 22:
+            return None
+        try:
+            created, modified, marker = unpack('<QQi', payload[:20])
+        except Exception:
+            return None
+        if marker != 0:
+            return None
+        try:
+            name = payload[20:].decode('utf-16-le').partition('\x00')[0]
+        except (UnicodeDecodeError, ValueError):
+            return None
+        if not name or len(name) > 64 or not re.fullmatch(r'[\w.\-]+', name):
+            return None
+        return name, created, modified
 
     def build(self, file, src_dir, nested=False, *, offset=0):
         self.offset = offset

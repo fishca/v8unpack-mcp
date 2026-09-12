@@ -296,21 +296,21 @@ class MetaObject:
                 continue
             if os.path.isdir(_obj_code_dir):
                 self.header[f'code_info_{code_name}'] = helper.brace_file_read(_obj_code_dir, 'info')
-                try:
-                    self.code[code_name], encoding = self.read_raw_code(_obj_code_dir, 'text',
-                                                                        uncomment_directive=uncomment_directive)
-                    self.header[f'code_encoding_{code_name}'] = encoding  # можно безболезненно поменять на utf-8-sig
-                except FileNotFoundError as err:
-                    # todo могут быть зашифрованные модули тогда файл будет # image.json - зашифрованный контент
-                    not_encrypted = True
+                code, encoding = self.read_raw_code(_obj_code_dir, 'text',
+                                                    uncomment_directive=uncomment_directive)
+                if code is None:
+                    # read_raw_code глотает FileNotFoundError и возвращает (None, 'utf-8'):
+                    # файла text нет — закрытый модуль (текст удалён, остались image/bin)
                     for encrypted_type in self.encrypted_types:
                         if os.path.isfile(os.path.join(_obj_code_dir, encrypted_type)):
                             self.code[code_name] = helper.bin_read(_obj_code_dir, encrypted_type)
                             self.header[f'code_encoding_{code_name}'] = encrypted_type
-                            not_encrypted = False
                             break
-                    if not_encrypted:
-                        raise err from err
+                    else:
+                        raise FileNotFoundError(f'{_obj_code_dir}{os.sep}text')
+                else:
+                    self.code[code_name] = code
+                    self.header[f'code_encoding_{code_name}'] = encoding
             else:
                 code_file_name = f'{self.header["uuid"]}.{self.ext_code[code_name]}'
                 self.code[code_name], encoding = self.read_raw_code(src_dir, code_file_name,
@@ -358,7 +358,11 @@ class MetaObject:
                 helper.makedirs(_code_dir)
                 helper.brace_file_write(self.header[f'code_info_{code_name}'], _code_dir, 'info')
                 if encoding in self.encrypted_types:
-                    helper.bin_write(self.code[code_name], _code_dir, 'text')
+                    # 'bin' — это бинарное содержимое именно text (шифрованный исходник,
+                    # TNSoft-стиль {3,3,1}); 'image' — отдельный файл байт-кода, его
+                    # пишем под родным именем, иначе платформа не найдёт байт-код
+                    helper.bin_write(self.code[code_name], _code_dir,
+                                     'text' if encoding == 'bin' else encoding)
                 else:
                     self.write_raw_code(self.code[code_name], _code_dir, 'text', encoding=encoding,
                                         comment_directive=comment_directive)

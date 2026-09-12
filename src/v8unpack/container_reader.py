@@ -31,6 +31,17 @@ def extract(filename, folder, deflate=True, recursive=True):
             try:
                 container = detect_format(f, offset)
                 container.read(f, offset)
+            except EOFError:
+                return
+            except Exception:
+                # Хвост файла, не являющийся контейнером (напр., журнал блоков
+                # атомарной записи после TOC — контейнеры с реальным
+                # first_empty_block_offset). После успешного чтения хотя бы одного
+                # контейнера считаем его концом файла; иначе это ошибка формата.
+                if container_index > 0:
+                    return
+                raise
+            try:
                 container.extract(os.path.join(folder, str(container_index)), deflate, recursive,
                                   progress=container_index)
                 container_index += 1
@@ -39,8 +50,6 @@ def extract(filename, folder, deflate=True, recursive=True):
                     raise NotImplementedError()
             except EOFError:
                 return
-            except Exception as err:
-                raise err from err
 
     print(f"{datetime.now() - begin}")
 

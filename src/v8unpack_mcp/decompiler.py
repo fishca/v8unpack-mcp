@@ -231,7 +231,7 @@ class Decompiler:
 
     def _fix_label(self, index):
         if index in self.labels:
-            self.text += "\n\n" + self.labels[index] + ":"
+            self.text += "\n\n" + self.labels.pop(index) + ":"
 
     def _flush_stack(self):
         for i in range(self.top + 1):
@@ -286,6 +286,10 @@ class Decompiler:
         self.idx = m.entry
         last = self._find_method_end(m)
         while self.idx <= last:
+            # Метка может указывать на любой адрес (goto-обфускация), поэтому
+            # проверяем её на каждом опкоде, а не только в структурированных
+            # конструкциях; _fix_label изымает метку из словаря — дублей нет.
+            self._fix_label(self.idx)
             self._process_opcode(m, last, ignore_end=False)
             self.idx += 1
 
@@ -459,7 +463,9 @@ class Decompiler:
             # на стеке и выводится на ближайшем LineNum — получаем линейный читаемый код.
             pass
         elif op == 42:  # Перейти Метка
-            lbl = next((n for n, o in m.labels if o == arg), f"Метка{arg}")
+            # аргумент — ИНДЕКС в списке меток метода (как МеткиПерехода[Аргумент]
+            # в 1C-inversion), а не адрес операции
+            lbl = m.labels[arg][0] if 0 <= arg < len(m.labels) else f"Метка{arg}"
             self.text += "\n\nПерейти " + lbl + ";"
         elif op == 43:  # Инкремент (невидим)
             self.top -= 1

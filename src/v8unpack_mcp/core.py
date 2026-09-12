@@ -345,7 +345,7 @@ def _object_info(obj_dir: str, type_name: str) -> dict:
                     info["comment"] = data["comment"]
         elif fn.endswith(".obj.bsl"):
             info["has_module"] = True
-        elif fn.endswith(".obj.bin"):
+        elif fn.endswith(".obj.bin") or fn.endswith(".obj.image"):
             info["has_encrypted_module"] = True
     forms = _object_forms(obj_dir)
     if forms:
@@ -437,12 +437,24 @@ def get_metadata(dir_path: str, object_path: str = "", detail: bool = False) -> 
     return result
 
 
+def _is_encrypted_module(rel: str) -> bool:
+    """Закрытый модуль: .obj.bin (шифрованный text) или .obj.image (байт-код без text)."""
+    return rel.endswith(".obj.bin") or rel.endswith(".obj.image")
+
+
+def _encrypted_module_note(rel: str) -> str:
+    if rel.endswith(".obj.image"):
+        return ("Модуль закрыт: текст удалён, есть только байт-код (image). "
+                "Используйте read_bytecode; декомпиляция — по образцу TNSoft/уат.")
+    return "Модуль защищён (зашифрован). Исходник без пароля не восстановить."
+
+
 def _find_module_files(obj_dir: str) -> list:
-    """Модульные файлы объекта: *.obj.bsl (текст) и *.obj.bin (шифрованный)."""
+    """Модульные файлы объекта: *.obj.bsl (текст) и закрытые *.obj.bin / *.obj.image."""
     modules = []
     for dirpath, _dirnames, filenames in os.walk(obj_dir):
         for fn in filenames:
-            if fn.endswith(".obj.bsl") or fn.endswith(".obj.bin"):
+            if fn.endswith(".obj.bsl") or fn.endswith(".obj.bin") or fn.endswith(".obj.image"):
                 full = os.path.join(dirpath, fn)
                 rel = os.path.relpath(full, obj_dir)
                 modules.append((rel, full))
@@ -533,7 +545,7 @@ def read_module(dir_path: str, object_path: str = "", module_name: str = "", ran
     if not module_name:
         listing = []
         for rel, full in modules:
-            kind = "encrypted" if rel.endswith(".obj.bin") else "bsl"
+            kind = "encrypted" if _is_encrypted_module(rel) else "bsl"
             listing.append({"name": rel, "kind": kind})
         return {"object": object_path or "<корень>", "modules": listing}
 
@@ -541,14 +553,14 @@ def read_module(dir_path: str, object_path: str = "", module_name: str = "", ran
     rel, full = target
     with open(full, "rb") as f:
         data = f.read()
-    if rel.endswith(".obj.bin"):
+    if _is_encrypted_module(rel):
         return {
             "object": object_path or "<корень>",
             "module": rel,
             "kind": "encrypted",
-            "encoding": "bin",
+            "encoding": "image" if rel.endswith(".obj.image") else "bin",
             "content": None,
-            "note": "Модуль защищён (зашифрован). Исходник без пароля не восстановить.",
+            "note": _encrypted_module_note(rel),
         }
     from .textlayers import decode_text
     content = decode_text(data)
@@ -585,12 +597,12 @@ def get_module_structure(dir_path: str, object_path: str = "", module_name: str 
     if not module_name:
         listing = []
         for rel, full in modules:
-            kind = "encrypted" if rel.endswith(".obj.bin") else "bsl"
+            kind = "encrypted" if _is_encrypted_module(rel) else "bsl"
             listing.append({"name": rel, "kind": kind})
         return {"object": object_path or "<корень>", "modules": listing}
 
     rel, full = _select_module(modules, module_name, object_path)
-    if rel.endswith(".obj.bin"):
+    if _is_encrypted_module(rel):
         return {
             "object": object_path or "<корень>",
             "module": rel,

@@ -123,11 +123,26 @@ def read_module_image_from_raw(raw_dir, uuid):
 
 
 def module_uuid(extract_root, object_path):
-    """uuid объекта из его .id.json в организованном дереве."""
+    """uuid объекта из его .id.json в организованном дереве.
+
+    Для корня epf/erf .id.json нет — uuid берём из json метаданных объекта
+    (например ExternalDataProcessor.json, поле "uuid")."""
+    import json
+    import re
+
     obj_dir = os.path.join(extract_root, object_path) if object_path else extract_root
     for fn in os.listdir(obj_dir):
         if fn.endswith(".id.json"):
-            import json
             with open(os.path.join(obj_dir, fn), "r", encoding="utf-8") as f:
                 return json.load(f)["uuid"]
+    for fn in os.listdir(obj_dir):
+        if re.fullmatch(r"[^.]+\.json", fn):
+            path = os.path.join(obj_dir, fn)
+            try:
+                with open(path, "r", encoding="utf-8-sig") as f:
+                    data = json.load(f)
+            except (OSError, ValueError):
+                continue
+            if isinstance(data, dict) and data.get("uuid"):
+                return data["uuid"]
     raise FileNotFoundError(f"uuid объекта {object_path or '<корень>'} не найден")

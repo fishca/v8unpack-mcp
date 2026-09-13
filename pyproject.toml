@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "v8unpack-mcp"
-version = "0.2.0"
+version = "0.3.0"
 description = "MCP-сервер для полного цикла работы с бинарными файлами 1С без EDT (unpack → чтение/правка → repack → cleanup)"
 requires-python = ">=3.10"
 license = { text = "MIT" }

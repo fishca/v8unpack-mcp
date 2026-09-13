@@ -697,8 +697,89 @@ class Decompiler:
         return "\n\n".join(parts)
 
 
+# Признак обфусцированного модуля: команды, достижимые из двух и более входов
+# методов. Штатный компилятор раскладывает методы непересекающимися регионами
+# потока; обфускатор («Декомпилятор1Сv8» и подобные) сливает всё в один граф —
+# у запутанных образов 94% адресов общие (замер 13.09.2026: hello/тест_опкоды —
+# 0 общих адресов, decomp — 14893 из 15778).
+OBFS_LIMIT_SHARED_ADDRS = 0
+
+
+def shared_region_count(image):
+    """Число адресов потока, достижимых из 2+ входов методов (0 — штатная раскладка).
+
+    Статический обход из каждого входа метода (entry != 0): безусловные и
+    условные переходы по абсолютному аргументу, `Перейти` — по таблице меток
+    метода-владельца; EndProc останавливает обход.
+    """
+    ops = _raw_opcodes(image)
+    n = len(ops)
+    procs = image.get("proc", [])[2:]
+    entries = sorted({int(p[3]) for p in procs if p[3] not in ("0", "")})
+    order = {e: i for i, e in enumerate(entries)}
+
+    def owner(pc):
+        import bisect
+        j = bisect.bisect_right(entries, pc) - 1
+        return j if j >= 0 else None
+
+    # Перейти (42) резолвится по таблице меток метода-владельца: {"Lbl",N,{"имя","адрес"},...}
+    # аргумент 42 — ИНДЕКС метки в таблице метода
+    labels = {}
+    for p in procs:
+        e = int(p[3])
+        if e == 0 or e not in order:
+            continue
+        for sub in p[4:]:
+            if sub and sub[0] == '"Lbl"':
+                for idx, rec in enumerate(sub[2:]):
+                    labels[(order[e], idx)] = int(rec[1])
+
+    reach = {}  # адрес -> множество входов (индексов)
+    for e in entries:
+        own = order[e]
+        stack, seen = [e], set()
+        while stack:
+            pc = stack.pop()
+            if pc in seen or pc < 0 or pc >= n:
+                continue
+            seen.add(pc)
+            op, arg = ops[pc]
+            if op == 22:            # EndProc — граница метода
+                continue
+            if op in (39, 40, 41):  # Jmp/JF/JT — абсолютный адрес
+                stack.append(arg)
+                stack.append(pc + 1)
+            elif op == 42:          # Перейти — индекс в таблице меток владельца
+                tgt = labels.get((owner(pc), arg))
+                if tgt is not None:
+                    stack.append(tgt)
+            else:
+                stack.append(pc + 1)
+        for pc in seen:
+            reach.setdefault(pc, set()).add(own)
+    return sum(1 for s in reach.values() if len(s) > 1)
+
+
+def is_obfuscated(image):
+    """Модуль запутан обфускатором (линейная декомпиляция невозможна)?"""
+    return shared_region_count(image) > OBFS_LIMIT_SHARED_ADDRS
+
+
+OBFUSCATED_MESSAGE = (
+    "Модуль обфусцирован, автоматическое восстановление текста недоступно. "
+    "Для анализа можете использовать виртуальную машину"
+)
+
+
 def decompile_image(image):
-    """Декомпилировать разобранный `image` (из bytecode.parse_image) в текст BSL."""
+    """Декомпилировать разобранный `image` (из bytecode.parse_image) в текст BSL.
+
+    Обфусцированные модули (слимый поток, общие регионы методов) не декомпилируются:
+    линейная модель декомпилятора рассчитана на штатную раскладку компилятора.
+    """
+    if is_obfuscated(image):
+        raise ValueError(OBFUSCATED_MESSAGE)
     return Decompiler(image).decompile()
 
 

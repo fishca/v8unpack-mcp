@@ -161,6 +161,22 @@ class Decoder:
     @classmethod
     def encode_include(cls, params):
         include_type, (new_src_dir, entry, dest_dir, options, parent_id, parent_container_uuid, include_index) = params
+        # Гранулярная сборка: нетронутый объект переносится из raw-слоя без
+        # кодирования (см. object_index); рекурсия по его вложенным не нужна —
+        # raw-файлы объекта уже содержат всё поддерево.
+        skip_map = (options or {}).get('skip_objects')
+        if skip_map is not None:
+            root = options.get('organized_root')
+            rel = os.path.relpath(os.path.abspath(new_src_dir), os.path.abspath(root)).replace(os.sep, '/')
+            raw_files = skip_map.get(rel)
+            if raw_files is not None:
+                from .object_index import copy_raw_object
+                file_list = copy_raw_object(raw_files, options['raw_root'], dest_dir)
+                return (
+                    dict(parent_id=parent_id, file_list=file_list, obj_type=include_type,
+                         obj_name=entry, obj_uuid=None, obj_data=None),
+                    None,
+                )
         try:
             handler = helper.get_class_metadata_object(include_type)
 

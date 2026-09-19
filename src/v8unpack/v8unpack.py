@@ -7,6 +7,8 @@ import tempfile
 from datetime import datetime
 
 from . import helper
+from . import object_index
+from .helper import RAW_DIR
 from .container_reader import extract as container_extract, decompress_and_extract
 from .container_writer import build as container_build, compress_and_build
 from .decoder import decode, encode
@@ -17,7 +19,6 @@ from .helper import check_index, load_json
 from .index import update_index
 from .version import __version__
 
-RAW_DIR = '.v8unpack_raw'
 FINGERPRINT_FILE = 'fingerprint'
 
 
@@ -63,12 +64,18 @@ def _restore_raw_snapshot(in_dir, stage1_dir):
         saved_fp = f.read()
     if saved_fp != _dir_fingerprint(in_dir):
         return False
+    _copy_raw_snapshot(raw_dir, stage1_dir)
+    return True
+
+
+def _copy_raw_snapshot(raw_dir, stage1_dir):
+    """Перенести контейнеры raw-слоя в stage1 (служебные файлы не трогаем)."""
     helper.clear_dir(stage1_dir)
     for entry in os.listdir(raw_dir):
-        if entry == FINGERPRINT_FILE:
-            continue
+        if entry in (FINGERPRINT_FILE, object_index.INDEX_FILE) \
+                or not os.path.isdir(os.path.join(raw_dir, entry)):
+            continue  # служебные файлы (fingerprint, objects.json) и прочие не-каталоги
         shutil.copytree(os.path.join(raw_dir, entry), os.path.join(stage1_dir, entry))
-    return True
 
 
 def extract(in_filename: str, out_dir_name: str, *, temp_dir=None, index=None, processes=None, options=None):
@@ -115,6 +122,12 @@ def extract(in_filename: str, out_dir_name: str, *, temp_dir=None, index=None, p
 
         if options.get('keep_raw'):
             _save_raw_snapshot(dir_stage1, out_dir_name)
+            # пообъектный индекс для гранулярной organized-сборки (best effort)
+            try:
+                from . import object_index
+                object_index.build_and_save(out_dir_name, os.path.join(out_dir_name, RAW_DIR))
+            except Exception as err:
+                print(f'{"Пообъектный индекс не построен":30}: {err}')
 
         end = datetime.now()
         print(f'{"Готово":30}: {end - begin0}')
@@ -157,16 +170,49 @@ def build(in_dir_name: str, out_file_name: str, *, temp_dir=None, index=None,
         descent = options.get('descent') if options else None
 
         raw_restored = False
+        skip_map = None
         if options.get('use_raw'):
-            raw_restored = _restore_raw_snapshot(in_dir_name, dir_stage1)
+            raw_dir = os.path.join(in_dir_name, RAW_DIR)
+            analysis = None
+            # Гранулярный анализ: при наличии пообъектного индекса заменяет собой
+            # глобальный fingerprint (легаси-каталоги без objects.json — как раньше).
+            if index is None and descent is None and os.path.isdir(raw_dir):
+                try:
+                    analysis = object_index.analyze(in_dir_name, raw_dir)
+                except Exception as err:
+                    print(f'{"Гранулярная сборка недоступна":30}: {err}')
+            if analysis is not None:
+                skip_map, all_unchanged = analysis
+                if all_unchanged:
+                    _copy_raw_snapshot(raw_dir, dir_stage1)
+                    raw_restored = True
+                    skip_map = None
+            else:
+                raw_restored = _restore_raw_snapshot(in_dir_name, dir_stage1)
 
         if not raw_restored:
+            # Гранулярная сборка: нетронутые объекты (skip_map) переносим из raw-слоя,
+            # кодируем только изменённые и новые. Ключи skip-карты — relpath папок
+            # организованного дерева; stage3 зеркалит его (нетронутые — заглушками),
+            # organized_root указываем на stage3 после OrganizerFile.pack.
+            if skip_map:
+                options['skip_objects'] = skip_map
+                options['raw_root'] = os.path.join(in_dir_name, RAW_DIR)
+
             if descent is None:
-                OrganizerFile.pack(in_dir_name, dir_stage3, pool=pool, index=index)
+                OrganizerFile.pack(in_dir_name, dir_stage3, pool=pool, index=index, skip_folders=skip_map)
             else:
                 OrganizerFileCE.pack(in_dir_name, dir_stage3, pool=pool, index=index, descent=descent)
 
+            if skip_map:
+                options['organized_root'] = os.path.abspath(dir_stage3)
+
             encode(dir_stage3, dir_stage1, pool=pool, file_name=os.path.basename(out_file_name), options=options)
+
+            if skip_map:
+                print(f'{"Гранулярная сборка":30}: из raw перенесено объектов: {len(skip_map)}')
+                for key in ('skip_objects', 'raw_root', 'organized_root'):
+                    options.pop(key, None)
 
         # json_encode(dir_stage2, dir_stage1, pool=pool)
 

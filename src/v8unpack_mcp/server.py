@@ -23,7 +23,10 @@ def _dump(obj) -> str:
 
 @mcp.tool(description="Полная распаковка файла 1С (.cf/.cfe/.epf/.erf) в отдельный временный "
                       "каталог (без лимита размера, любые объекты). Первый шаг любого цикла. "
-                      "Возвращает путь к каталогу (организованное дерево + raw-слой .v8unpack_raw)")
+                      "Возвращает путь к каталогу: организованное дерево (Тип/Имя + .json/.bsl/"
+                      "формы/макеты) + raw-слой .v8unpack_raw (brace-файлы) с пообъектным "
+                      "индексом objects.json — он включает гранулярную сборку repack "
+                      "(нетронутые объекты переносятся из raw без перекодирования)")
 def unpack(file_path: str) -> str:
     return _dump(core.unpack(file_path))
 
@@ -44,14 +47,19 @@ def job_status(job_id: str) -> str:
     return _dump(core.job_status(job_id))
 
 
-@mcp.tool(description="Собрать файл 1С из распакованного каталога (результат unpack) в целевой файл")
+@mcp.tool(description="Собрать файл 1С из распакованного каталога (результат unpack) в целевой файл. "
+                      "Путь сборки выбирается автоматически: дерево не правили — всё из raw-слоя "
+                      "побайтово; правили часть объектов — гранулярная сборка (нетронутые объекты, "
+                      "включая закрытые модули, из raw; изменённые/новые — из организованного дерева); "
+                      "индекса нет — полная organized-сборка")
 def repack(dir_path: str, output_path: str) -> str:
     return _dump(core.repack(dir_path, output_path))
 
 
-@mcp.tool(description="АСИНХРОННАЯ сборка файла 1С из распакованного каталога. Запускает работу "
-                      "в фоновом задании и СРАЗУ возвращает {job_id, status:'running'}. Результат "
-                      "получите через job_status (status='done', поле result)")
+@mcp.tool(description="АСИНХРОННАЯ сборка файла 1С из распакованного каталога (правила выбора "
+                      "пути сборки — как у repack). Запускает работу в фоновом задании и СРАЗУ "
+                      "возвращает {job_id, status:'running'}. Результат получите через job_status "
+                      "(status='done', поле result)")
 def repack_async(dir_path: str, output_path: str) -> str:
     return _dump(core.start_repack(dir_path, output_path))
 
@@ -91,6 +99,27 @@ def get_module_structure(dir_path: str, object_path: str = "", module_name: str 
                       "из raw-слоя каталога unpack")
 def read_bytecode(dir_path: str, object_path: str = "") -> str:
     return _dump(core.read_bytecode(dir_path, object_path))
+
+
+@mcp.tool(description="Поиск ЗАКРЫТЫХ модулей в распакованном каталоге (шаг 2 цикла "
+                      "'unpack → find_closed_modules → decompile_modules → repack'). "
+                      "Возвращает список модулей (.obj/.mgr/... .bin|.image) с вариантом защиты "
+                      "(info), наличием байт-кода (has_image) и признаком обфускации; "
+                      "decompilable = есть image и модуль не обфусцирован. "
+                      "check_obfuscation=false — быстрый скан без разбора байт-кода")
+def find_closed_modules(dir_path: str, check_obfuscation: bool = True) -> str:
+    return _dump(core.find_closed_modules(dir_path, check_obfuscation))
+
+
+@mcp.tool(description="Декомпиляция закрытых модулей в organized-дереве (шаг 3): заменяет "
+                      ".obj.bin/.obj.image (и .mgr/.con/...) на .bsl с декомпилированным текстом "
+                      "и правит header объекта (кодирование utf-8-sig, info открытого модуля). "
+                      "objects — пути папок объектов через запятую (пусто = корень epf/erf); "
+                      "не задано — ВСЕ закрытые модули. Оригинальные бинарники удаляются без "
+                      "бэкапа (каталог распаковки временный). Обфусцированные и без байт-кода "
+                      "пропускаются со статусом. Сборку файла делает штатный repack")
+def decompile_modules(dir_path: str, objects: str = "") -> str:
+    return _dump(core.decompile_modules(dir_path, objects))
 
 
 @mcp.tool(description="Поиск подстроки/regex по текстовым слоям распакованного каталога. "

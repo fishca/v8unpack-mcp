@@ -50,6 +50,8 @@ class OrganizerFileCE(OrganizerFile):
         except FileNotFoundError:
             entries = []
         for entry in entries:
+            if entry == helper.RAW_DIR:  # служебный raw-слой в обход не входит
+                continue
             full_path = os.path.join(_dir, entry)
             if os.path.isdir(full_path):
                 result.append(entry)

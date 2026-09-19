@@ -131,7 +131,7 @@ class OrganizerFile:
         return dest_path, dest_file_name
 
     @classmethod
-    def pack(cls, src_dir, dest_dir, *, pool=None, index=None, descent=None):
+    def pack(cls, src_dir, dest_dir, *, pool=None, index=None, descent=None, skip_folders=None):
         begin = datetime.now()
         print(f'{"Собираем код":30}')
         try:
@@ -143,7 +143,8 @@ class OrganizerFile:
             if index:
                 cls._pack_index(src_dir, dest_dir, tasks_code_file, tasks_form_elem, index, index_code_areas, [''],
                                 descent)
-            cls._pack(src_dir, dest_dir, '', tasks_code_file, tasks_form_elem, index, index_code_areas, descent)
+            cls._pack(src_dir, dest_dir, '', tasks_code_file, tasks_form_elem, index, index_code_areas, descent,
+                      skip_folders)
             helper.run_in_pool(OrganizerCode.pack, tasks_code_file, pool=pool, title=f'{"Собираем код из файлов":30}')
             helper.run_in_pool(OrganizerFormElem.pack, tasks_form_elem, pool=pool,
                                title=f'{"Собираем элементы форм":30}')
@@ -248,10 +249,13 @@ class OrganizerFile:
 
     @classmethod
     def list_descent_dir(cls, src_dir, path, descent) -> list[str]:
-        return os.listdir(os.path.join(src_dir, path))
+        # raw-слой — служебный, в organized-обход не входит (иначе его brace-файлы
+        # ломают сборку отредактированного дерева как «неизвестный тип метаданных»)
+        return [e for e in os.listdir(os.path.join(src_dir, path)) if e != helper.RAW_DIR]
 
     @classmethod
-    def _pack(cls, src_dir, dest_dir, path, tasks_code_file, tasks_form_elem, index, index_code_areas, descent=None):
+    def _pack(cls, src_dir, dest_dir, path, tasks_code_file, tasks_form_elem, index, index_code_areas, descent=None,
+              skip_folders=None):
         if path:
             helper.makedirs(os.path.join(dest_dir, path), exist_ok=True)
         entries = cls.list_descent_dir(src_dir, path, descent)
@@ -260,8 +264,16 @@ class OrganizerFile:
                 src_entry_path = os.path.join(src_dir, path, entry)
 
                 if os.path.isdir(os.path.normcase(src_entry_path)):
+                    # Гранулярная сборка: нетронутые папки объектов не копируем —
+                    # их файлы попадут в контейнер из raw-слоя (decoder.encode_include);
+                    # пустая папка нужна, чтобы задача на объект всё же создалась.
+                    if skip_folders is not None and path:
+                        rel = f'{path}/{entry}'.replace(os.sep, '/')
+                        if rel in skip_folders:
+                            helper.makedirs(os.path.join(dest_dir, path, entry), exist_ok=True)
+                            continue
                     cls._pack(src_dir, dest_dir, os.path.join(path, entry), tasks_code_file, tasks_form_elem, index,
-                              index_code_areas, descent)
+                              index_code_areas, descent, skip_folders)
                     continue
                 _src_path = os.path.join(src_dir, path)
                 descent_full_src_path, descent_file_name = cls.pack_get_descent_filename(

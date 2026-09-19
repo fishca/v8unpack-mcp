@@ -12,6 +12,10 @@ from tqdm.auto import tqdm
 from .ext_exception import ExtException
 from .json_container_decoder import JsonContainerDecoder, BigBase64
 
+# Служебный каталог raw-слоя в распакованном дереве (снапшот для сборки).
+# Обходчики organized-дерева его пропускают (organizer_file*.list_descent_dir).
+RAW_DIR = '.v8unpack_raw'
+
 
 def brace_file_read(path, file_name):
     _path = os.path.normpath(os.path.join(path, file_name))

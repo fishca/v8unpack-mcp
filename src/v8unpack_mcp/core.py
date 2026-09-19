@@ -18,7 +18,6 @@ import uuid as uuid_mod
 
 from v8unpack import extract, build
 from v8unpack import helper as v8helper
-from v8unpack.organizer_file import OrganizerFile
 
 # Файлы 1С, которые умеем читать.
 SUPPORTED_EXTENSIONS = {".cf", ".cfe", ".epf", ".erf"}
@@ -79,15 +78,8 @@ def _serial_get_pool(*, pool=None, processes=None):
 # main-модуль и ломают stdio-транспорт MCP).
 v8helper.get_pool = _serial_get_pool
 
-
-def _list_descent_dir_skip_raw(cls, src_dir, path, descent):
-    """Обход организованного дерева, пропуская raw-слой (.v8unpack_raw)."""
-    return [e for e in os.listdir(os.path.join(src_dir, path)) if e != RAW_DIR]
-
-
-# Пропускаем .v8unpack_raw при pack/unpack организованного дерева, иначе OrganizerFile.pack
-# спотыкается о brace-файлы raw-слоя, когда организованное дерево отредактировано.
-OrganizerFile.list_descent_dir = classmethod(_list_descent_dir_skip_raw)
+# Пропуск raw-слоя (.v8unpack_raw) при обходе organized-дерева теперь в самой
+# библиотеке (organizer_file.list_descent_dir) — monkey-patch больше не нужен.
 
 
 def _extract_silent(path: str, out_dir: str, options: dict = None) -> None:
@@ -639,6 +631,176 @@ def read_bytecode(dir_path: str, object_path: str = ""):
     }
 
 
+# --- Закрытые модули: поиск и декомпиляция ---
+# Цикл из четырёх независимых шагов: unpack → find_closed_modules →
+# decompile_modules → repack. Каталог распаковки считается временным:
+# бинарники-оригиналы (.bin/.image) при открытии модуля удаляются БЕЗ бэкапа.
+
+_MODULE_KINDS = ("obj", "mgr", "con", "app", "ssn")
+_OPEN_CODE_INFO = [["3", "1", "0", "\"\"", "0"]]
+
+
+def _iter_closed_module_files(root):
+    """Файлы закрытых модулей в organized-дереве.
+
+    yields (dirpath, prefix, kind, ext): например .../CommonModule/ТН_Сервер +
+    ('CommonModule', 'obj', 'bin'); для корня epf — ('ExternalDataProcessor', 'obj', ...).
+    """
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d != RAW_DIR]
+        for fn in sorted(filenames):
+            stem, _, ext = fn.rpartition(".")
+            if ext not in ("bin", "image"):
+                continue
+            prefix, _, kind = stem.rpartition(".")
+            if kind in _MODULE_KINDS:
+                yield dirpath, prefix, kind, ext
+
+
+def _object_uuid_for_module(dirpath, prefix, header):
+    """uuid объекта: из <prefix>.id.json, иначе из header (корень epf/erf без id.json)."""
+    id_path = os.path.join(dirpath, f"{prefix}.id.json")
+    if os.path.isfile(id_path):
+        with open(id_path, encoding="utf-8") as f:
+            return json.load(f).get("uuid")
+    return header.get("uuid")
+
+
+def _scan_closed_modules(root, check_obfuscation=True):
+    """Список закрытых модулей с признаками декомпилируемости."""
+    from . import bytecode
+    from .decompiler import is_obfuscated
+
+    raw_dir = os.path.join(root, RAW_DIR)
+    result = []
+    for dirpath, prefix, kind, ext in _iter_closed_module_files(root):
+        header = {}
+        header_path = os.path.join(dirpath, f"{prefix}.json")
+        try:
+            with open(header_path, encoding="utf-8") as f:
+                header = json.load(f)
+        except (OSError, ValueError):
+            pass
+        uuid = _object_uuid_for_module(dirpath, prefix, header)
+        entry = {
+            "object_path": os.path.relpath(dirpath, root).replace("\\", "/"),
+            "module": kind,
+            "file": os.path.relpath(os.path.join(dirpath, f"{prefix}.{kind}.{ext}"),
+                                    root).replace("\\", "/"),
+            "encoding": ext,
+            "uuid": uuid,
+            "info": header.get(f"code_info_{kind}"),
+            "has_image": False,
+            "obfuscated": None,
+        }
+        if entry["object_path"] == ".":
+            entry["object_path"] = ""
+        if uuid and os.path.isdir(raw_dir):
+            try:
+                img = bytecode.read_module_image_from_raw(raw_dir, uuid)
+                entry["has_image"] = True
+                if check_obfuscation:
+                    entry["obfuscated"] = bool(is_obfuscated(img))
+            except FileNotFoundError:
+                pass
+        entry["decompilable"] = entry["has_image"] and not entry["obfuscated"]
+        result.append(entry)
+    return result
+
+
+def find_closed_modules(dir_path: str, check_obfuscation: bool = True) -> dict:
+    """Найти закрытые модули в распакованном каталоге (шаг цикла после unpack).
+
+    Возвращает modules[] с путями объекта/файла, вариантом защиты (info),
+    наличием байт-кода (has_image) и признаком обфускации; сводные счётчики.
+    decompilable = has_image и не obfuscated.
+    """
+    root = _require_dir(dir_path)
+    modules = _scan_closed_modules(root, check_obfuscation=check_obfuscation)
+    return {
+        "total": len(modules),
+        "decompilable": sum(1 for m in modules if m["decompilable"]),
+        "obfuscated": sum(1 for m in modules if m["obfuscated"]),
+        "no_image": sum(1 for m in modules if not m["has_image"]),
+        "modules": modules,
+    }
+
+
+def decompile_modules(dir_path: str, objects: str = "") -> dict:
+    """Декомпилировать закрытые модули в organized-дереве (замена .bin/.image на .bsl).
+
+    objects — список путей папок объектов через запятую (как object_path у других
+    инструментов, пусто для корня epf/erf); пусто/None — все найденные модули.
+    Оригинальные бинарники удаляются без бэкапа (каталог распаковки временный).
+    Сборку файла после декомпиляции выполняет штатный repack — гранулярная сборка
+    пересоберёт только затронутые объекты.
+    """
+    from . import bytecode
+    from .decompiler import OBFUSCATED_MESSAGE, decompile_image
+
+    root = _require_dir(dir_path)
+    raw_dir = os.path.join(root, RAW_DIR)
+    if not os.path.isdir(raw_dir):
+        raise FileNotFoundError(f"В каталоге нет raw-слоя {RAW_DIR} — unpack должен выполняться с keep_raw")
+    selected = {s.strip() for s in objects.split(",") if s.strip()} if objects else None
+
+    report = []
+    opened = skipped = failed = 0
+    for entry in _scan_closed_modules(root, check_obfuscation=False):
+        if selected and entry["object_path"] not in selected:
+            continue
+        if not entry["has_image"]:
+            entry.update(status="skipped_no_image")
+            skipped += 1
+            report.append(entry)
+            continue
+        try:
+            text = decompile_image(bytecode.read_module_image_from_raw(raw_dir, entry["uuid"]))
+        except ValueError as err:
+            if str(err) != OBFUSCATED_MESSAGE:
+                raise
+            entry.update(status="skipped_obfuscated")
+            skipped += 1
+            report.append(entry)
+            continue
+        except Exception as err:
+            entry.update(status="error", error=f"{type(err).__name__}: {err}")
+            failed += 1
+            report.append(entry)
+            continue
+
+        # file = <папки>/<prefix>.<kind>.<ext>: .bsl кладём как <prefix>.<kind>.bsl,
+        # header объекта — <prefix>.json (kind в его имени нет)
+        base_rel = entry["file"].rsplit(".", 1)[0]           # <папки>/<prefix>.<kind>
+        prefix_rel = base_rel.rpartition(".")[0]              # <папки>/<prefix>
+        closed_path = os.path.join(root, *entry["file"].split("/"))
+        bsl_path = os.path.join(root, *base_rel.split("/")) + ".bsl"
+        header_path = os.path.join(root, *prefix_rel.split("/")) + ".json"
+        os.remove(closed_path)
+        with open(bsl_path, "w", encoding="utf-8-sig", newline="") as f:
+            f.write(text)
+
+        with open(header_path, encoding="utf-8") as f:
+            header = json.load(f)
+        header[f"code_info_{entry['module']}"] = [list(_OPEN_CODE_INFO[0])]
+        header[f"code_encoding_{entry['module']}"] = "utf-8-sig"
+        with open(header_path, "w", encoding="utf-8") as f:
+            json.dump(header, f, ensure_ascii=False, indent=2)
+
+        entry.update(status="opened", lines=text.count("\n") + 1)
+        del entry["decompilable"]
+        opened += 1
+        report.append(entry)
+
+    return {
+        "opened": opened,
+        "skipped": skipped,
+        "failed": failed,
+        "modules": report,
+        "next_step": "repack(dir_path, ...) — сборка файла с открытыми модулями",
+    }
+
+
 def _find_matches(text: str, pattern: str, regex: bool, case_sensitive: bool, max_per_file: int):
     flags = 0 if case_sensitive else re.IGNORECASE
     if regex:
@@ -723,7 +885,10 @@ def repack(dir_path: str, output_path: str) -> dict:
     """Собрать файл 1С из распакованного каталога (результат unpack) в целевой файл.
 
     dir_path — каталог, возвращённый unpack; output_path — путь к собираемому файлу.
-    Сборка использует raw-слой (.v8unpack_raw), если организованное дерево не правилось.
+    Путь сборки выбирается автоматически (см. README «Как собирает repack»):
+    нет правок — побайтово из raw-слоя; правка части объектов — гранулярная сборка
+    (нетронутые из raw, изменённые/новые из organized-дерева); без индекса —
+    полная organized-сборка.
     """
     dir_path = _require_dir(dir_path)
     output_path = os.path.abspath(output_path)

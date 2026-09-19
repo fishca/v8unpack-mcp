@@ -154,6 +154,19 @@ class FormCore(SimpleNameFolder):
         if not self.form or not self.form[0]:
             return
         self.header['Версия элементов формы'] = self.header['Тип формы']
+        # Управляемые формы формата 802 (8.2): внутренняя версия макета элементов
+        # form[0][0][1][0] = 25-28, у 803+ = 35-59. FormElements4 понимает только
+        # раскладку 803+ — такие формы не разбираем (и не собираем) вовсе:
+        # элементы остаются сырым блоком form в organized JSON.
+        if self.header['Тип формы'] != OF:
+            try:
+                inner_version = self.form[0][0][1][0]
+            except (IndexError, TypeError):
+                inner_version = None
+            if isinstance(inner_version, str) and inner_version.isdigit() and int(inner_version) < 30:
+                self.header['Версия элементов формы'] = \
+                    f'{self.header["Тип формы"]} (802, элементы не разбираются: {inner_version})'
+                return
         try:
             return self.supported_form_versions[self.header['Версия элементов формы']]
         except KeyError:

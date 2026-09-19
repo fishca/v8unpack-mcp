@@ -315,12 +315,17 @@ class Container:
             doc = Document(self)
 
             if total_blocks == 1:
-                doc.write_block(f, doc_size=doc_size, offset=self.header_size)
+                # блок TOC всегда добивается до index_block_size — под него
+                # резерв в write_header, и только так ридер корректно считает
+                # границу контейнера (как пишет сама 1С: min_block=0x200/0x10000)
+                doc.write_block(f, doc_size=doc_size, offset=self.offset + self.header_size,
+                                min_block_size=self.index_block_size)
             else:
                 f.seek(0)
-                next_block_offset = file_size(self.file)
+                # цепочка блоков TOC: next тоже относительное смещение
+                next_block_offset = file_size(self.file) - self.offset
                 doc.write_block(io.BytesIO(f.read(self.index_block_size)),
-                                doc_size=doc_size, offset=self.header_size,
+                                doc_size=doc_size, offset=self.offset + self.header_size,
                                 min_block_size=self.index_block_size,
                                 next_block_offset=next_block_offset)
                 self.file.seek(0, os.SEEK_END)
@@ -352,7 +357,11 @@ class Container:
         else:
             data_doc_offset = doc.write(fd, min_block_size=self.default_block_size)
 
-        self.toc.append((attribute_doc_offset, data_doc_offset))
+        # Смещения в TOC хранятся ОТНОСИТЕЛЬНО начала контейнера (ридер при
+        # чтении прибавляет container.offset). Для контейнера, дописанного в
+        # конец файла после первого (cf: Format15-заглушка + Format64-хвост),
+        # абсолютные смещения ломают чтение второго контейнера.
+        self.toc.append((attribute_doc_offset - self.offset, data_doc_offset - self.offset))
 
     @staticmethod
     def int2hex(value):
